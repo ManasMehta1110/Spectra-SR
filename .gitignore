@@ -1,0 +1,29 @@
+.venv/
+gpuenv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.env
+
+# Satellite imagery and checkpoints are large and don't belong in git -- pushed/pulled via HF
+# Hub instead (see scripts/hf_checkpoint.py). Keep directory placeholders only.
+data/**
+!data/.gitkeep
+!data/**/.gitkeep
+*.tif
+*.tiff
+*.pth
+*.ckpt
+# Model weights. These are .pt (not .pth) -- the earlier "*.pth" line did NOT match them, and
+# checkpoints/ had grown to 542MB of files that would have been committed. The per-epoch metric
+# logs and comparison images are deliberately NOT excluded: they are small (120KB total) and are
+# the actual experimental record of every run.
+*.pt
+# Raw console logs: redundant with epoch_log.jsonl (same metrics, structured) and dominated by
+# GDAL TIFF warnings -- run5's was 9.9MB of them alone.
+*_console.log
+results/*.csv
+results/*.jsonl
+!results/.gitkeep
