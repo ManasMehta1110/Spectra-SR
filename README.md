@@ -24,11 +24,28 @@ before anything else is trusted.
 
 ## Status
 
-Phase 0 (scaffolding) -- repo structure in place, `stats.py` ported, `gpuenv` confirmed working
-(torch 2.11.0+cu128, CUDA available; rasterio 1.5.0). Stage 0 (the degradation operator and its
-acceptance test) is next -- see [`docs/plan.md`](docs/plan.md) for the full execution plan,
-scope (Core vs. Stretch), build order with go/no-go gates, data acquisition strategy, and risk
-register.
+**Core pipeline built and training end to end** on real cross-sensor data. Stages 0 (degradation
+operator), 1 (preprocessing), 3 (HAT-inspired core), 5 (data-consistency projection), 6-slim
+(heteroscedastic uncertainty head) and 7 (guardrails) exist with test coverage; 78 tests passing.
+
+Training data is the [SEN2NAIP cross-sensor
+set](https://huggingface.co/datasets/isp-uv-es/SEN2NAIP) -- 2,851 same-day-acquired real
+Sentinel-2 L2A / NAIP pairs, not synthetic degradation.
+
+**Not yet clearing its own bar.** No run has beaten bicubic interpolation on held-out data. Nine
+runs were invalidated by a dead residual branch (the network was returning its bicubic skip
+connection unchanged, so every metric was measuring bicubic against bicubic); that and four other
+bugs are fixed and documented with the measurements that found them in
+[`docs/findings.md`](docs/findings.md). Post-fix, the architecture beats bicubic by **+8.21 dB**
+on a memorisation diagnostic, confirming it can learn; generalisation is the current open problem.
+
+Two components remain deliberately unfinished and should not be presented otherwise: Stage 5's
+projection is implemented and unit-tested but **not yet wired into the training/inference path**,
+and `guardrails.out_of_distribution_check` raises `NotImplementedError` pending real trained-model
+feature statistics.
+
+See [`docs/plan.md`](docs/plan.md) for the execution plan and scope gating, and
+[`docs/findings.md`](docs/findings.md) for the experimental record.
 
 ## Setup
 
@@ -65,5 +82,6 @@ notebooks/          exploratory / experiment notebooks
 analysis/           result aggregation, figures
 paper/              writeup, once there's something to write up
 docs/plan.md        the full execution plan
+docs/findings.md    measured results, bugs found, negative results, experimental record
 data/                (gitignored) raw/ and processed/ imagery -- see docs/plan.md Section 4
 ```
