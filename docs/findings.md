@@ -139,12 +139,24 @@ val PSNR **21.86 dB**.
 
 Recorded because they cost real time and are worth not repeating.
 
-- **Edge-aware gradient loss does nothing.** Added at weight 0.3, raised to 2.5 (an 8x increase).
-  Across seven epochs the term moved only in the fourth decimal (0.1159-0.1167). At weight 2.5 it
-  accounted for **60.9%** of total loss while being completely inert -- meaning most of the
-  optimisation signal was going into a term with no effect. Now set to 0.
-- **More data alone does not fix blur.** 19 -> 47 NAIP tiles gave a consistent +0.6-0.7 dB PSNR
-  gain and *no* movement on the downstream task metric.
+- ~~**Edge-aware gradient loss does nothing.**~~ **RETRACTED -- this conclusion does not survive
+  Bug 1.** It was drawn from runs 3-4, which are inside the invalidated range. If the residual is
+  dead then `output == bicubic` exactly, so `gradient_loss(bicubic, hr)` has *no parameter
+  dependence at all* and its gradient w.r.t. every weight is identically zero. Inertness was
+  guaranteed a priori, not measured. The observed variation across 20 epochs of run 4 was 1.16%
+  (0.166146-0.168076), i.e. sampling noise from random crops, not learning.
+
+  The tell was there and went unread: a term at **60.9% of total loss** moving only in the fourth
+  decimal is not a weak signal, it is a *disconnected* one. That should have prompted the question
+  "is this term attached to the graph?" rather than "is this term useless?".
+
+  Consequence: `w_gradient=0` currently removes the stated mitigation for an open risk in
+  `plan.md` ("pixel-loss blurs fine linear features") on evidence that does not hold. **Pending
+  re-measurement on the fixed architecture.**
+- ~~**More data alone does not fix blur.**~~ **RETRACTED for the same reason** -- runs 1-2, also
+  inside the invalidated range. The measured +0.6-0.7 dB PSNR gain from 19 -> 47 NAIP tiles is
+  real, but "no movement on the downstream metric" is uninformative: the downstream metric was
+  comparing bicubic against bicubic. Pending re-measurement.
 - **Alignment filtering helps, but is not sufficient.** Pairs with QA1 <= 0.5 px show 22% better
   edge correlation and +1.42 dB bicubic PSNR than pairs with QA1 > 0.85. Training only on the
   well-aligned subset improved SSIM but still plateaued 0.8 dB below bicubic -- because the
@@ -195,7 +207,25 @@ only, but **QA2** (spectral angle, up to 2.0 deg) was dropped at the same time. 
 inconsistent spectral relationships may admit no learnable mapping. Proposed test: restore
 QA2 <= 1.5 while keeping all alignment qualities -> 2,179 tiles, still ~4x run 9.
 
-Not yet acted on; awaiting epochs 2-3 to distinguish a trend from noise.
+**Resolved at epoch 2: it was a transient, not a trend.** Every term recovered to its epoch-0
+level without any intervention:
+
+| val term | ep0 | ep1 | ep2 | ep0 -> ep2 |
+|---|---|---|---|---|
+| index_loss | 0.1537 | 0.3480 | 0.1596 | +3.9% |
+| sam_loss | 0.0915 | 0.1735 | 0.0919 | +0.5% |
+| charbonnier | 0.0797 | 0.1002 | 0.0804 | +0.8% |
+| ssim_loss | 0.3513 | 0.3611 | 0.3434 | -2.2% |
+
+A structural objective mismatch does not self-correct while training continues. The QA2 hypothesis
+is therefore **not supported** and the filter was not restored.
+
+Two external code reviews (obtained independently) both diagnosed this spike as structural -- one
+attributing it to a physically incompatible cycle-consistency constraint, the other to
+unlearnable per-tile radiometric offsets. Both were written before epoch 2 existed. Measured cycle
+contribution at epoch 2 is **0.1% of total loss** (raw 0.0006, falling), so that suspect is
+negligible regardless. Recorded as a caution: a two-point trend is not a trend, and reviewing one
+invites over-diagnosis.
 
 ---
 
