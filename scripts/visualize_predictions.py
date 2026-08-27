@@ -63,25 +63,27 @@ def _iter_naip_synthetic(args, cfg, hr_patch_size):
 
 
 def _iter_sen2naip(args, cfg, hr_patch_size):
-    """Yields (name, lr, hr) on DEVICE from real SEN2NAIP cross-sensor pairs -- no degradation
-    simulation, lr.tif IS the real Sentinel-2 observation. Same normalization constants and
-    LR/HR crop alignment as SEN2NAIPCrossSensorDataset, so what's visualized is genuinely what
-    the model trained/validated on."""
-    from spectra_sr.sen2naip_dataset import NATIVE_SCALE, _split_train_val_rois
+    """Yields (name, lr, hr) on DEVICE from real SEN2NAIP cross-sensor pairs.
+
+    Goes through SEN2NAIPCrossSensorDataset rather than re-reading the GeoTIFFs here. That is
+    deliberate: this function previously duplicated the loading logic (read lr.tif, divide by
+    10000) and silently drifted out of sync when radiometric calibration was added to the dataset.
+    The model was then fed uncalibrated input with mean ~0.16 while having been trained on
+    calibrated input with mean ~0.48 -- roughly 3x too dark -- and rendered near-black predictions
+    that looked like a catastrophic model failure but were purely a visualization bug. Any
+    preprocessing the dataset applies must reach this path automatically, so there is exactly one
+    place that defines what the model is fed.
+    """
+    from spectra_sr.sen2naip_dataset import SEN2NAIPCrossSensorDataset, _split_train_val_rois
 
     _, val_rois = _split_train_val_rois(args.sen2naip_dir, args.val_fraction)
     print(f"Held-out val ROIs ({len(val_rois)}), showing first {args.n_samples}")
-    lr_patch_size = hr_patch_size // NATIVE_SCALE
 
-    for roi in val_rois:
-        roi_dir = os.path.join(args.sen2naip_dir, roi)
-        with rasterio.open(os.path.join(roi_dir, "lr.tif")) as src:
-            lr_raw = src.read(window=rasterio.windows.Window(0, 0, lr_patch_size, lr_patch_size))
-        with rasterio.open(os.path.join(roi_dir, "hr.tif")) as src:
-            hr_raw = src.read(window=rasterio.windows.Window(0, 0, hr_patch_size, hr_patch_size))
-        lr = torch.from_numpy(lr_raw.astype(np.float32)).unsqueeze(0).to(DEVICE) / 10000.0
-        hr = torch.from_numpy(hr_raw.astype(np.float32)).unsqueeze(0).to(DEVICE) / 255.0
-        yield roi, lr, hr
+    ds = SEN2NAIPCrossSensorDataset(args.sen2naip_dir, hr_patch_size=hr_patch_size,
+                                     crops_per_file=1, roi_list=val_rois, seed=args.seed)
+    for i, roi in enumerate(val_rois[:args.n_samples]):
+        lr, hr = ds[i]
+        yield roi, lr.unsqueeze(0).to(DEVICE), hr.unsqueeze(0).to(DEVICE)
 
 
 def main():
@@ -94,17 +96,28 @@ def main():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--n-samples", type=int, default=3)
     p.add_argument("--val-fraction", type=float, default=0.2)
+    p.add_argument("--seed", type=int, default=1,
+                   help="Matches train_pretrain.py's val dataset seed (train seed + 1) so the "
+                        "visualized crops are the same ones validation actually scored.")
+    p.add_argument("--res-scale", type=float, default=None,
+                   help="Override res_scale. Only needed for checkpoints saved "
+                        "before res_scale was recorded in the checkpoint itself.")
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     ckpt = torch.load(args.checkpoint, map_location=DEVICE)
     cfg = CONFIGS[ckpt["config"]]
+    rs = args.res_scale if args.res_scale is not None else ckpt.get("res_scale")
+    if rs is not None and rs != cfg.res_scale:
+        from dataclasses import replace
+        cfg = replace(cfg, res_scale=rs)
     model = SpectraHATCore(cfg).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"Loaded {args.checkpoint} (config={ckpt['config']}, epoch={ckpt['epoch']}, "
-          f"val_total_loss={ckpt['val_total_loss']:.4f}, data_source={args.data_source})")
+          f"val_total_loss={ckpt['val_total_loss']:.4f}, res_scale={cfg.res_scale}, "
+          f"data_source={args.data_source})")
 
     hr_patch_size = cfg.train_patch_size * cfg.scale
     source = (_iter_sen2naip if args.data_source == "sen2naip" else _iter_naip_synthetic)

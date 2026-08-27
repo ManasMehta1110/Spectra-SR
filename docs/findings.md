@@ -229,6 +229,36 @@ invites over-diagnosis.
 
 ---
 
+## Run 10, epoch 9: first statistically real gain over bicubic
+
+Measured on 150 held-out ROIs the model never trained on.
+
+| test | result |
+|---|---|
+| mean paired PSNR difference | **+0.2672 dB** |
+| 95% CI | +0.1107 to +0.4237 (excludes zero) |
+| paired t-test | p = 0.00104 |
+| Wilcoxon signed-rank | p = 0.00496 |
+| Cohen's d | **0.273 (small)** |
+| tiles where SR beats bicubic | **78/150 (52%)** |
+
+Detail recovery is genuine rather than added noise -- gradient-field correlation against the true
+HR is **0.4016 (SR) vs 0.3652 (bicubic)**, i.e. the model's edges land where real edges are. A
+model emitting random high-frequency content would score *worse* on this, not better.
+
+**Reporting correction.** This was first written up as "67% more edge energy than bicubic"
+(0.0735 vs 0.0440 mean gradient magnitude). That figure is arithmetically right and analytically
+wrong: edge *energy* measures how much high-frequency content exists, not whether it is correctly
+placed. The defensible number is edge *correlation*, **+10.0% relative**. Quote that one.
+
+**Honest reading.** Statistically real, practically marginal. A 52% win rate means bicubic still
+wins on nearly half of held-out tiles; the positive mean comes from winning by more on the tiles
+it wins than it loses by elsewhere. What this result establishes is that the model performs
+genuine super-resolution rather than returning its bicubic skip connection -- the failure that
+invalidated runs 1-6. It does not establish a model whose output one would confidently prefer.
+
+---
+
 ## Method notes
 
 - **The capacity diagnostic should have come first.** `scripts/diagnose_model_capacity.py` asks
@@ -242,3 +272,15 @@ invites over-diagnosis.
   produces meaningless comparisons.
 - **A metric that suddenly looks excellent deserves more suspicion than one that looks bad.**
   Bug 4 presented as a +58 point win.
+- **Distinguish "is the signal present" from "is it in the right place".** Edge energy answers the
+  first, edge correlation answers the second, and only the second is evidence of super-resolution.
+  Reporting the first alone overstated the result by roughly 6x.
+- **Report the win rate alongside the mean.** +0.27 dB with p=0.001 sounds decisive; 52% of tiles
+  says otherwise. Both are true and only the pair is honest.
+- **Never load a checkpoint into a config it was not trained with.** `res_scale` is a plain
+  attribute, not a parameter, so `load_state_dict` accepts the mismatch silently and the forward
+  pass is simply wrong. Checkpoints now record their own architecture values.
+- **Do not duplicate the data-loading path.** `visualize_predictions.py` re-read the GeoTIFFs
+  itself and missed the radiometric calibration added later to the dataset, feeding the model
+  input ~3x too dark and producing near-black output that looked like catastrophic model failure.
+  Evaluation code must consume the same dataset class training does.

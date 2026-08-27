@@ -278,6 +278,13 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
         checkpoint_state = {
             "model": model.state_dict(), "uncertainty_head": uncertainty_head.state_dict(),
             "config": config_name, "epoch": epoch, "val_total_loss": val_avg["total_loss"],
+            # Record architecture values, not just the config NAME. res_scale is a plain scalar
+            # attribute rather than a learned parameter, so load_state_dict() succeeds silently
+            # against a model built with a different res_scale -- every group then contributes the
+            # wrong residual magnitude and the output is garbage, with no error raised. Hit this
+            # for real: run10 was trained at res_scale=0.2, and reloading it under the config
+            # default of 0.1 produced near-black predictions.
+            "res_scale": cfg.res_scale,
         }
 
         # Rolling window, not "keep every epoch forever" -- COLAB_REALISTIC checkpoints are
