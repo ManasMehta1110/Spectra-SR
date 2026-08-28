@@ -1,5 +1,17 @@
 # SPECTRA-SR — Full Execution Plan (SIH26142, Sentinel-2 Super-Resolution)
 
+**Status note (post run-10):** this plan was written before any training run existed. Section 4's
+data-source priority order (PlanetScope → archival Cartosat-2 → NAIP → Maxar) and the "10m
+Sentinel-2 + NAIP synthetic pretraining" framing in Section 1/5 describe the *original* plan --
+what actually happened is documented in `findings.md`. In short: the SEN2NAIP cross-sensor
+dataset (real Sentinel-2 paired with real NAIP, not synthetic) became the primary data source and
+is what run 10 was trained and evaluated on; PlanetScope E&R access is now confirmed working
+(search API verified against real AOIs, download provisioning pending); the Cartosat-2/Maxar
+threads below are superseded, not pursued. Sections 2/3/6/8 (compute strategy, scope gating,
+verification) and the architecture note still hold as written, with the parameter counts
+corrected against what was actually measured (see the architecture note at the bottom). Treat
+this file as the original intent; `findings.md` as what is real.
+
 ## Context
 
 The team has locked in two SIH 2026 problem statements to pursue — **SIH26142** (NTRO, Sentinel-2 10m → <4m super-resolution) and **SIH26170** (ISRO, component burn-in anomaly detection) — and decided to work SIH26142 first, sequentially, with the full 6-person team. A complete architecture spec for SIH26142 ("SPECTRA-SR") already exists, written by the user, and has been audited for risk (blind-kernel-estimation instability, pixel-loss blurring of fine linear features, wall-clock cost of ensembles, HR-reference-data availability, registration/temporal mismatch, tooling-complexity jump from the team's prior EDSR work). The user now wants the *whole plan* — sequencing, data strategy, compute strategy, scope gating, and reused-code mapping — fully locked and audited before any implementation begins, mirroring the ablation/verification discipline already visible in the team's prior work.
@@ -113,7 +125,7 @@ Each phase has a concrete stop-and-check condition before moving on — this is 
 
 | Risk | Status |
 |---|---|
-| HR reference data unobtainable | **In progress** — PlanetScope E&R application submitted, stated turnaround up to 3 weeks. Core scope (Stages 0/1/3/5/6-slim/7) doesn't depend on it landing -- all buildable and testable against NAIP + synthetic pairs in the meantime. Real fine-tune/validate on Indian terrain is blocked until it (or archival Cartosat-2/another source) lands. |
+| HR reference data unobtainable | **Resolved for non-Indian training/eval** — the SEN2NAIP cross-sensor dataset (real Sentinel-2 x real NAIP, not synthetic) supplied 2,851 pairs (v1) and a further 8,000 (v2); run 10 trained and was evaluated on v1. PlanetScope E&R access is confirmed working (search API verified against real AOIs, incl. Indian coordinates; download provisioning still pending). Indian fine-tune/validate remains open but is not currently blocking -- deprioritized per team decision to focus on the core training run first. |
 | Degradation operator mis-specified | **Mitigated by design** — Stage 0 acceptance test is a hard gate (Section 5) |
 | Pixel-loss blurs fine linear features (roads, boundaries) | **Open** — add an edge-aware/gradient-domain auxiliary loss term to Stage 3's loss stack; do not treat "deterministic = risk-free" |
 | MISR fusion may not help (team's own prior guided-fusion result was negative) | **Mitigated by design** — ablation-first build order (Section 5, phase 7), reusing `stats.py` directly |
@@ -154,7 +166,8 @@ verbatim) → output conv. Deliberately deterministic throughout — no adversar
 component in Stage 3, for the same hallucination-risk reason `DualEDSRPlus`'s own GAN
 alternative was rejected on the prior project.
 
-Two configs: `FULL` (180 embed dim, 6×6 groups/blocks, window 16, ~20M params) and
-`COLAB_REALISTIC` (112 embed dim, 4×4, window 8, ~6-8M params) — start with
-`COLAB_REALISTIC` given the compute strategy in Section 2, only scale up once it clears the
-Phase 3 gate.
+Two configs: `FULL` (180 embed dim, 6×6 groups/blocks, window 16, **15,514,816 params measured**)
+and `COLAB_REALISTIC` (112 embed dim, 4×4, window 8, **3,572,532 params measured** -- a 4.34x
+capacity ratio between the two, not the ~3x the original estimate implied) — `COLAB_REALISTIC`
+cleared its own bar at run 10 (+0.69 dB over bicubic, 74% win rate, still improving when training
+stopped -- see `findings.md`); `FULL` is the next run, not yet trained even once.

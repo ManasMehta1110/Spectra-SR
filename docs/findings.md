@@ -19,6 +19,17 @@ measuring bicubic against bicubic.
 
 The bug and four others are described below with the measurements that identified them.
 
+**Run 10, after the fixes, is the first model that consistently beats bicubic**: +0.6948 dB
+(21.706 vs 21.011), 74% win rate on 200 held-out tiles, p=2.2e-09. Stage 5's data-consistency
+projection and Stage 6's uncertainty calibration are both wired in and measured. Two further
+ablations -- uncertainty-head edge features (kept, small real effect) and raised spectral loss
+weights (not kept, no benefit where it matters) -- were run to settle open questions before
+committing to a larger, more expensive training run. See "Pre-big-run checks" and the two
+sections after it, near the end of this file, for that work; the sections between here and
+there are the original nine-run debugging history, kept in full because the bugs and negative
+results in it are exactly what stops the next round of experiments from re-discovering the same
+dead ends.
+
 ---
 
 ## Bug 1: dead residual branch (the one that mattered)

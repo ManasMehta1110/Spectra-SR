@@ -124,11 +124,11 @@ def run_guardrails(x_hat: torch.Tensor, y: torch.Tensor, degradation_operator: D
 
 
 def out_of_distribution_check(encoder_features, training_manifold_stats, threshold: float) -> bool:
-    """NOT IMPLEMENTED -- needs real training-manifold feature statistics from a trained Stage 3
-    encoder, which doesn't exist yet (only smoke-tested, never trained on real data at scale).
-    Build once Stage 3 has real trained weights; a placeholder here would mean faking statistics
-    or a check that silently always passes/fails, which is worse than leaving this honestly
-    unimplemented."""
+    """NOT IMPLEMENTED -- needs real training-manifold feature statistics collected from Stage 3's
+    encoder over its actual training set. Trained weights now exist (run 10 and later), so the
+    remaining gap is the collection/fitting step itself, not a lack of anything to fit against.
+    A placeholder here would mean faking statistics or a check that silently always passes/fails,
+    which is worse than leaving this honestly unimplemented until it's built for real."""
     raise NotImplementedError(
         "Needs real training-manifold statistics from a trained Stage 3 model -- not available "
         "yet. See module docstring."
