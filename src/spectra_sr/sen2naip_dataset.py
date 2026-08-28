@@ -54,6 +54,33 @@ LR_BAND_STD = (0.07874, 0.05099, 0.04068, 0.08075)
 HR_BAND_MEAN = (0.48517, 0.47471, 0.38936, 0.55600)
 HR_BAND_STD = (0.15607, 0.12043, 0.11127, 0.11993)
 
+# Per-release geometry and radiometry. SEN2NAIPv2's cross-sensor release differs from v1 in ways
+# that are silent rather than loud if ignored -- every one of these was measured from the real
+# archives, not assumed:
+#
+#   * tiles are 520/130 px, not 484/121;
+#   * HR is uint16 in Sentinel-2 reflectance units, NOT uint8 NAIP. Dividing v2's HR by 255 (the
+#     v1 rule) overshoots by ~40x and silently trains on nonsense -- nothing raises, the images
+#     are simply wrong;
+#   * HR has ALREADY been harmonized to the Sentinel-2 radiometric scale. Measured over the
+#     first 20 ROIs, per-band HR/LR mean ratios are 1.000/0.999/0.999/1.000 -- max deviation
+#     0.07%, against v1's 2.0-5.3x per-band mismatch. Applying v1's affine calibration to v2
+#     would therefore INTRODUCE the very error it exists to remove.
+DATASET_VARIANTS = {
+    "v1": {
+        "hr_tile_size": 484, "lr_tile_size": 121,
+        "hr_divisor": 255.0,     # NAIP uint8
+        "lr_divisor": 10000.0,   # Sentinel-2 L2A reflectance, scaled x10000
+        "radiometric_calibration": True,
+    },
+    "v2": {
+        "hr_tile_size": 520, "lr_tile_size": 130,
+        "hr_divisor": 10000.0,   # already in Sentinel-2 reflectance units
+        "lr_divisor": 10000.0,
+        "radiometric_calibration": False,
+    },
+}
+
 
 def calibrate_lr_to_hr_radiometry(lr: torch.Tensor) -> torch.Tensor:
     """Map real Sentinel-2 reflectance onto the NAIP radiometric scale with a fixed per-band
@@ -136,14 +163,24 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
 
     def __init__(self, root_dir: str, hr_patch_size: int = 384, crops_per_file: int = 20,
                  roi_list: Optional[List[str]] = None, seed: Optional[int] = None,
-                 radiometric_calibration: bool = True):
+                 radiometric_calibration: Optional[bool] = None, variant: str = "v1"):
+        if variant not in DATASET_VARIANTS:
+            raise ValueError(f"variant must be one of {sorted(DATASET_VARIANTS)}, got {variant!r}")
+        spec = DATASET_VARIANTS[variant]
+        hr_tile_size, lr_tile_size = spec["hr_tile_size"], spec["lr_tile_size"]
+        # An explicit argument still wins, so the flag remains testable; but the DEFAULT must come
+        # from the variant, because the right answer differs between releases and a silently
+        # wrong default here produces plausible-looking, badly-scaled imagery rather than an error.
+        if radiometric_calibration is None:
+            radiometric_calibration = spec["radiometric_calibration"]
+
         if hr_patch_size % NATIVE_SCALE != 0:
             raise ValueError(f"hr_patch_size ({hr_patch_size}) must be divisible by "
                               f"NATIVE_SCALE ({NATIVE_SCALE})")
         lr_patch_size = hr_patch_size // NATIVE_SCALE
-        if hr_patch_size > HR_TILE_SIZE or lr_patch_size > LR_TILE_SIZE:
+        if hr_patch_size > hr_tile_size or lr_patch_size > lr_tile_size:
             raise ValueError(f"hr_patch_size={hr_patch_size} (lr={lr_patch_size}) exceeds the "
-                              f"real tile size (hr={HR_TILE_SIZE}, lr={LR_TILE_SIZE})")
+                              f"{variant} tile size (hr={hr_tile_size}, lr={lr_tile_size})")
 
         self.rois = roi_list if roi_list is not None else sorted(
             d for d in os.listdir(root_dir)
@@ -156,6 +193,11 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
         self.lr_patch_size = lr_patch_size
         self.crops_per_file = crops_per_file
         self.radiometric_calibration = radiometric_calibration
+        self.variant = variant
+        self.hr_tile_size = hr_tile_size
+        self.lr_tile_size = lr_tile_size
+        self.hr_divisor = spec["hr_divisor"]
+        self.lr_divisor = spec["lr_divisor"]
         self.rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
@@ -165,7 +207,7 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
         roi = self.rois[idx % len(self.rois)]
         roi_dir = os.path.join(self.root_dir, roi)
 
-        max_lr_xy = LR_TILE_SIZE - self.lr_patch_size
+        max_lr_xy = self.lr_tile_size - self.lr_patch_size
         x0_lr = int(self.rng.integers(0, max_lr_xy + 1))
         y0_lr = int(self.rng.integers(0, max_lr_xy + 1))
         x0_hr, y0_hr = x0_lr * NATIVE_SCALE, y0_lr * NATIVE_SCALE
@@ -179,8 +221,83 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
 
         # Real Sentinel-2 L2A surface reflectance, scaled x10000 -- same convention already
         # defined (but unused until now) as Config.reflectance_scale.
-        lr = torch.from_numpy(lr_raw.astype(np.float32)) / 10000.0
-        hr = torch.from_numpy(hr_raw.astype(np.float32)) / 255.0  # NAIP uint8, same as NAIPPretrainDataset
+        lr = torch.from_numpy(lr_raw.astype(np.float32)) / self.lr_divisor
+        hr = torch.from_numpy(hr_raw.astype(np.float32)) / self.hr_divisor
         if self.radiometric_calibration:
             lr = calibrate_lr_to_hr_radiometry(lr)
         return lr, hr
+
+
+def synthetic_component_files(root_dir: str, era: str = "both",
+                              val_fraction: float = 0.2) -> Tuple[List[str], List[str]]:
+    """Train/val file lists over the SEN2NAIP *synthetic* component.
+
+    That component is structurally NOTHING like the cross-sensor one this module's Dataset
+    class reads, which is why it gets a plain file-list helper rather than a Dataset of its own:
+    a synthetic ROI holds `early/<naip>.tif` and `late/<naip>.tif` and its metadata carries
+    `s2_id: null`, `QA1: null`, `QA2: null` -- there is NO Sentinel-2 imagery in it at all. It is
+    HR NAIP only (1100x1100, 4-band uint8, 2.5m), and the LR side has to be synthesized.
+
+    Synthesizing LR from HR NAIP is exactly what `NAIPPretrainDataset` already does, including
+    the uint8 rescale, the band-count reconciliation and the per-sample sigma randomization. So
+    this returns file lists to hand that class via its `file_list=` argument instead of
+    duplicating tested crop/degradation logic here.
+
+    Note what this data is and is not. Because the LR side is simulated by our own operator, a
+    model trained on it learns to invert a degradation we chose -- an easier and different task
+    than the real cross-sensor one. Its role is PRETRAINING volume (plan Section 5, phase 3:
+    "trained on synthetic pairs, then fine-tuned on real Tier 2 pairs"); the real cross-sensor
+    pairs remain the only honest basis for reported accuracy.
+
+    `era` selects which acquisitions to use: "early", "late", or "both". "both" treats the two
+    dates as independent HR tiles, which roughly doubles the file count -- they share a footprint
+    but are separate acquisitions a decade apart, so their surface content genuinely differs.
+
+    The split is by ROI, never by file: with era="both" the two acquisitions of one ROI cover the
+    SAME ground, so splitting per-file would put a 2011 image of a field in train and a 2021
+    image of that same field in val, and the resulting val score would be inflated by
+    near-duplicate leakage rather than measuring generalization.
+    """
+    if era not in ("early", "late", "both"):
+        raise ValueError(f"era must be 'early', 'late' or 'both', got {era!r}")
+
+    # Each shard extracts to its OWN subdirectory (synthetic_01.zip -> `synthetic_1/ROI_*/...`),
+    # so the natural root -- the directory the shards were extracted into -- contains shard dirs
+    # rather than ROI dirs. Accept either, because pointing at the shard parent is the obvious
+    # thing to do and would otherwise fail with a confusing "no ROI dirs" error after a 10 GB
+    # download. ROI ids are drawn from one global space (shard 01 alone spans 1..104577), so
+    # merging shards cannot collide.
+    roi_dirs = {}  # ROI name -> absolute path, across however many shards are present
+    for entry in sorted(os.listdir(root_dir)):
+        path = os.path.join(root_dir, entry)
+        if not os.path.isdir(path):
+            continue
+        if entry.startswith("ROI_"):
+            roi_dirs[entry] = path
+        else:
+            for sub in sorted(os.listdir(path)):
+                if sub.startswith("ROI_") and os.path.isdir(os.path.join(path, sub)):
+                    roi_dirs[sub] = os.path.join(path, sub)
+
+    rois = sorted(roi_dirs)
+    if len(rois) < 5:
+        raise ValueError(f"Only {len(rois)} ROI dirs found under {root_dir} (searched it and one "
+                         f"level below, for extracted shard subdirectories) -- too few for a val "
+                         f"split.")
+
+    # Same deterministic strided split as _split_train_val_rois, so the held-out set is stable
+    # across runs and independent of seed.
+    n_val = max(1, round(len(rois) * val_fraction))
+    val_rois = set(rois[::len(rois) // n_val][:n_val])
+
+    eras = ("early", "late") if era == "both" else (era,)
+    train_files, val_files = [], []
+    for roi in rois:
+        target = val_files if roi in val_rois else train_files
+        for sub in eras:
+            target.extend(sorted(glob.glob(os.path.join(roi_dirs[roi], sub, "*.tif"))))
+
+    logger.info(f"SEN2NAIP synthetic ({era}): {len(train_files)} train files from "
+                f"{len(rois) - len(val_rois)} ROIs, {len(val_files)} val files from "
+                f"{len(val_rois)} ROIs")
+    return train_files, val_files

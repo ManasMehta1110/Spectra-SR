@@ -107,3 +107,54 @@ def test_expected_calibration_error_positive_for_overconfident():
     correct = torch.tensor([1.0, 0.0, 0.0, 0.0])  # 25% accurate but 95% confident
     ece = expected_calibration_error(confidence, correct, n_bins=1)
     assert ece > 0.5
+
+
+def test_edge_features_are_full_resolution_and_finite():
+    """The head's original only spatial input was an LR-resolution residual upsampled 4x, so every
+    4x4 output block shared one value and fine-scale error could not be localised (measured: r=0.19
+    against actual error). These features are computed from the prediction at full resolution, so
+    they must actually vary within a 4x4 block."""
+    from spectra_sr.uncertainty import _edge_features
+    x = torch.rand(2, 4, 32, 32)
+    grad, std = _edge_features(x)
+    assert grad.shape == (2, 1, 32, 32) and std.shape == (2, 1, 32, 32)
+    assert torch.isfinite(grad).all() and torch.isfinite(std).all()
+    assert (grad >= 0).all() and (std >= 0).all()
+    block = grad[0, 0, 8:12, 8:12]
+    assert float(block.std()) > 0, "features must vary within a 4x4 block or they add nothing"
+
+
+def test_edge_features_respond_to_edges_not_flat_regions():
+    from spectra_sr.uncertainty import _edge_features
+    flat = torch.full((1, 4, 32, 32), 0.5)
+    edged = flat.clone()
+    edged[:, :, :, 16:] = 0.9  # a real vertical step
+    g_flat, _ = _edge_features(flat)
+    g_edge, _ = _edge_features(edged)
+    assert float(g_edge.max()) > float(g_flat.max()) * 10
+
+
+def test_head_accepts_edge_features_and_matches_prediction_shape():
+    from spectra_sr.uncertainty import UncertaintyHead
+    for use in (True, False):
+        head = UncertaintyHead(n_bands=4, use_edge_features=use)
+        pred = torch.rand(2, 4, 32, 32)
+        residual = torch.rand(2, 4, 32, 32)
+        out = head(pred, residual)
+        assert out.shape == pred.shape
+        assert torch.isfinite(out).all()
+
+
+def test_edge_features_change_the_prediction():
+    """Guards against the features being wired in but ignored -- a head that produces identical
+    output with and without them would pass every shape test while fixing nothing."""
+    from spectra_sr.uncertainty import UncertaintyHead
+    torch.manual_seed(0)
+    head = UncertaintyHead(n_bands=4, use_edge_features=True).eval()
+    pred = torch.rand(1, 4, 32, 32)
+    residual = torch.rand(1, 4, 32, 32)
+    flat_pred = torch.full_like(pred, 0.5)
+    with torch.no_grad():
+        a = head(pred, residual)
+        b = head(flat_pred, residual)
+    assert not torch.allclose(a, b)

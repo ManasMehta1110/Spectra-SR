@@ -85,7 +85,8 @@ def _match_radiometry(source: torch.Tensor, reference: torch.Tensor) -> torch.Te
 
 
 def downstream_classification_agreement(sr_pred: torch.Tensor, lr_input: torch.Tensor,
-                                         hr_target: torch.Tensor, ndvi_threshold: float = 0.3
+                                         hr_target: torch.Tensor, ndvi_threshold: float = 0.3,
+                                         match_radiometry: str = "neither"
                                          ) -> DownstreamUtilityResult:
     """Real, checkable "does SR help a downstream task" ablation, per the PS's explicit
     "support better classification" language -- without needing an external labeled dataset.
@@ -96,15 +97,40 @@ def downstream_classification_agreement(sr_pred: torch.Tensor, lr_input: torch.T
     classification agrees with the true HR classification -- if SR doesn't measurably beat naive
     upsampling here, that's a real, honest finding worth knowing, not something to hide.
 
-    The bicubic baseline is radiometrically matched to hr_target before scoring (see
-    _match_radiometry) -- sr_pred needs no such matching, since it's already trained to predict
-    values on hr_target's own scale; only the "did nothing smart" baseline can inherit the raw
-    input sensor's un-matched scale.
+    `match_radiometry` controls whether per-sample mean/std matching against hr_target is applied,
+    and it must be applied SYMMETRICALLY or not at all:
+
+      "neither" (default) -- realistic deployment. Neither side sees hr_target's statistics.
+      "both"              -- isolates spatial structure by removing radiometry from the comparison.
+      "baseline_only"     -- LEGACY AND UNFAIR. Retained only to reproduce older numbers.
+
+    Why this parameter exists: an earlier version always matched the baseline and never the
+    prediction, which handed bicubic the ground-truth mean and standard deviation -- information
+    the model is never given. That inverted the result. Measured on 120 held-out tiles, continuous
+    NDVI error:
+
+        baseline_only : SR 0.0729 vs bicubic 0.0367  -> bicubic "wins"
+        neither       : SR 0.0729 vs bicubic 0.0842  -> SR wins, 72% of tiles, p=2e-07
+        both          : SR 0.0371 vs bicubic 0.0367  -> tied, p=0.15
+
+    The "both" row is the one to keep in mind before over-claiming: our advantage under "neither"
+    comes from having learned the cross-sensor radiometric mapping, not from the extra spatial
+    detail. Equalise radiometry and the structural gain does not yet show up in NDVI.
+
+    (The original motivation for matching was real -- un-matched bicubic once scored 0.256
+    agreement, worse than chance, purely from a brightness offset. That is now handled upstream by
+    the dataset's fixed radiometric calibration, so the per-sample fix is no longer needed.)
     """
+    if match_radiometry not in {"neither", "both", "baseline_only"}:
+        raise ValueError(f"match_radiometry must be neither/both/baseline_only, "
+                          f"got {match_radiometry!r}")
     with torch.no_grad():
         target_size = hr_target.shape[-2:]
         bicubic = F.interpolate(lr_input, size=target_size, mode="bicubic", align_corners=False)
-        bicubic = _match_radiometry(bicubic, hr_target)
+        if match_radiometry in {"both", "baseline_only"}:
+            bicubic = _match_radiometry(bicubic, hr_target)
+        if match_radiometry == "both":
+            sr_pred = _match_radiometry(sr_pred, hr_target)
 
         true_class = ndvi(hr_target) > ndvi_threshold
         sr_class = ndvi(sr_pred) > ndvi_threshold

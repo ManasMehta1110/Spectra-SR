@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import rasterio
 import torch
 
@@ -72,6 +73,38 @@ def test_downstream_agreement_survives_cross_sensor_brightness_mismatch(naip_pri
         f"radiometric mismatch alone should no longer tank baseline_agreement to near-random "
         f"(got {result.baseline_agreement:.3f})"
     )
+
+
+def test_radiometry_matching_is_symmetric_or_absent(naip_primary_file):
+    """Real bug this caught: the baseline was always radiometrically matched to the target while
+    the prediction never was, handing bicubic the ground-truth mean and standard deviation --
+    information the model is never given. That single asymmetry inverted the reported result
+    (bicubic 0.0367 vs SR 0.0729 became SR 0.0729 vs bicubic 0.0842 once corrected). Verify the
+    symmetric modes treat both sides alike, and that the unfair legacy mode is genuinely different
+    so it cannot be selected by accident.
+    """
+    with rasterio.open(naip_primary_file) as src:
+        hr_raw = src.read(window=rasterio.windows.Window(0, 0, 64, 64)).astype(np.float32)
+    hr = torch.from_numpy(hr_raw).unsqueeze(0)[:, :4] / 255.0
+    lr = torch.nn.functional.avg_pool2d(hr, kernel_size=4) * 0.4 + 0.05  # deliberate offset
+
+    neither = downstream_classification_agreement(hr, lr, hr, match_radiometry="neither")
+    both = downstream_classification_agreement(hr, lr, hr, match_radiometry="both")
+    legacy = downstream_classification_agreement(hr, lr, hr, match_radiometry="baseline_only")
+
+    # Under "neither" the prediction is untouched, so a perfect prediction stays perfect.
+    assert neither.sr_agreement == 1.0
+    # The legacy asymmetry must measurably favour the baseline relative to the fair modes.
+    assert legacy.baseline_agreement > neither.baseline_agreement
+    # "both" applies the same correction to each side, so the baseline is treated identically.
+    assert both.baseline_agreement == pytest.approx(legacy.baseline_agreement, abs=1e-6)
+
+
+def test_rejects_unknown_radiometry_mode():
+    x = torch.rand(1, 4, 16, 16) + 0.1
+    lr = torch.nn.functional.avg_pool2d(x, kernel_size=4)
+    with pytest.raises(ValueError, match="match_radiometry"):
+        downstream_classification_agreement(x, lr, x, match_radiometry="prediction_only")
 
 
 def test_downstream_agreement_degrades_for_a_genuinely_wrong_prediction(naip_primary_file):

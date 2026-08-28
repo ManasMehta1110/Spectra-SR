@@ -114,11 +114,18 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
           seed: int = 0, val_fraction: float = 0.2, keep_last_n: int = 3,
           lr: float = 1e-3, grad_clip_norm: float = 5.0, use_lr_schedule: bool = True,
           w_gradient: float = 0.3, w_perceptual: float = 0.0,
+          w_sam: float = 0.3, w_index: float = 0.2,
           data_source: str = "naip_synthetic",
+          sen2naip_synthetic_dir: str = "data/raw/sen2naip/synthetic",
+          sen2naip_synthetic_era: str = "both",
           sen2naip_dir: str = "data/raw/sen2naip/cross-sensor/cross-sensor",
           sen2naip_train_crops: int = 2, sen2naip_val_crops: int = 1,
+          sen2naip_variant: str = "v1",
           qa1_max: Optional[float] = None, qa2_max: Optional[float] = None,
-          res_scale: Optional[float] = None) -> dict:
+          res_scale: Optional[float] = None,
+          val_every_n_steps: int = 0, step_val_tiles: int = 64,
+          resume: Optional[str] = None, hf_backup_every_n_epochs: int = 0,
+          init_from: Optional[str] = None) -> dict:
     set_seed(seed)
     cfg = CONFIGS[config_name]
     if res_scale is not None:
@@ -128,6 +135,17 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
                 f'groups={cfg.n_groups}x{cfg.n_blocks_per_group} patch={cfg.train_patch_size}')
     os.makedirs(out_dir, exist_ok=True)
     epoch_log_path = os.path.join(out_dir, "epoch_log.jsonl")
+    # The log is opened in append mode throughout, which is what --resume needs: a resumed run
+    # must continue the same record rather than start a second one. For any run that is NOT a
+    # resume, appending is wrong -- relaunching into a directory that already holds a log would
+    # silently interleave two runs' epochs in one file, and anything reading it back
+    # (compare_runs.py, curve plots) would treat the mixture as a single run. Rotate instead of
+    # truncating, so an overwritten run's record is preserved rather than destroyed.
+    if not resume and os.path.exists(epoch_log_path):
+        rotated = os.path.join(out_dir, f"epoch_log.{int(time.time())}.jsonl")
+        os.rename(epoch_log_path, rotated)
+        logger.warning(f"{epoch_log_path} already existed (previous run in this directory); "
+                       f"moved it to {rotated} rather than appending to it.")
 
     # A DegradationOperator is still needed either way -- for "sen2naip" it's never used to
     # *simulate* LR (lr.tif already IS the real Sentinel-2 observation), only for the
@@ -152,10 +170,12 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
         # to keep epoch wall-clock time comparable to the earlier runs.
         train_dataset = SEN2NAIPCrossSensorDataset(sen2naip_dir, hr_patch_size=hr_patch_size,
                                                      crops_per_file=sen2naip_train_crops,
-                                                     roi_list=train_rois, seed=seed)
+                                                     roi_list=train_rois, seed=seed,
+                                                     variant=sen2naip_variant)
         val_dataset = SEN2NAIPCrossSensorDataset(sen2naip_dir, hr_patch_size=hr_patch_size,
                                                    crops_per_file=sen2naip_val_crops,
-                                                   roi_list=val_rois, seed=seed + 1)
+                                                   roi_list=val_rois, seed=seed + 1,
+                                                   variant=sen2naip_variant)
     elif data_source == "naip_synthetic":
         train_files, val_files = _split_train_val_files(naip_dir, val_fraction)
         logger.info(f"Train files: {len(train_files)}, held-out val files: {len(val_files)}")
@@ -181,6 +201,28 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
         val_dataset = NAIPPretrainDataset(naip_dir, val_degradation, hr_patch_size=hr_patch_size,
                                            crops_per_file=10, seed=seed + 1, file_list=val_files,
                                            sigma_range=None)
+    elif data_source == "sen2naip_synthetic":
+        # The SEN2NAIP synthetic component is HR NAIP only -- no Sentinel-2 in it at all (see
+        # synthetic_component_files' docstring). So it runs through exactly the naip_synthetic
+        # path: same NAIPPretrainDataset, same operator-simulated LR, same two-instance
+        # degradation split. The only difference is where the file list comes from.
+        from spectra_sr.sen2naip_dataset import synthetic_component_files
+        train_files, val_files = synthetic_component_files(
+            sen2naip_synthetic_dir, era=sen2naip_synthetic_era, val_fraction=val_fraction)
+
+        dataset_degradation = DegradationOperator(n_bands=cfg.n_bands, scale=cfg.scale)
+        with torch.no_grad():
+            dataset_degradation.log_sigma.fill_(fixed_sigma)
+        train_dataset = NAIPPretrainDataset(
+            sen2naip_synthetic_dir, dataset_degradation, hr_patch_size=hr_patch_size,
+            crops_per_file=sen2naip_train_crops, seed=seed, file_list=train_files)
+        val_degradation = DegradationOperator(n_bands=cfg.n_bands, scale=cfg.scale)
+        with torch.no_grad():
+            val_degradation.log_sigma.fill_(fixed_sigma)
+        val_dataset = NAIPPretrainDataset(
+            sen2naip_synthetic_dir, val_degradation, hr_patch_size=hr_patch_size,
+            crops_per_file=sen2naip_val_crops, seed=seed + 1, file_list=val_files,
+            sigma_range=None)
     else:
         raise ValueError(f"Unknown data_source: {data_source!r}")
 
@@ -190,7 +232,10 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
     model = SpectraHATCore(cfg).to(DEVICE)
     uncertainty_head = UncertaintyHead(n_bands=cfg.n_bands).to(DEVICE)
     criterion = SpectraCombinedLoss(degradation, w_gradient=w_gradient,
-                                     w_perceptual=w_perceptual).to(DEVICE)
+                                     w_perceptual=w_perceptual,
+                                     w_sam=w_sam, w_index=w_index).to(DEVICE)
+    logger.info(f'loss weights: charbonnier=1.0 ssim=0.2 sam={w_sam} index={w_index} '
+                f'cycle=0.5 gradient={w_gradient} perceptual={w_perceptual}')
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(uncertainty_head.parameters()), lr=lr)
     # Real, confirmed finding from pretrain_run1/run2/run3 (all three, despite varying data
@@ -211,8 +256,103 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
     best_val_total = float("inf")
     best_checkpoint_path = os.path.join(out_dir, "checkpoint_best.pt")
     kept_checkpoints = []  # rolling window of recent (non-best) checkpoint paths
+    start_epoch = 0
 
-    for epoch in range(epochs):
+    # Warm start: load WEIGHTS ONLY, and begin a fresh run at epoch 0 with a fresh optimiser and
+    # a fresh LR schedule. Deliberately distinct from --resume, which continues an interrupted
+    # run and must restore optimiser/schedule state to be correct. The two would be actively
+    # wrong if conflated: fine-tuning wants a fresh schedule at the new (usually lower) LR, while
+    # resuming wants the original schedule continued from where it stopped.
+    #
+    # This is the mechanism for the plan's Phase 3 sequence (pretrain on synthetic pairs, then
+    # fine-tune on real cross-sensor pairs) and for loss-weight sweeps that start from an
+    # already-converged core rather than paying for convergence once per arm.
+    if init_from:
+        if resume:
+            raise ValueError("--init-from and --resume are mutually exclusive: the first starts "
+                             "a new run from borrowed weights, the second continues an old run.")
+        if not os.path.exists(init_from):
+            raise FileNotFoundError(f"--init-from checkpoint not found: {init_from}")
+        ckpt = torch.load(init_from, map_location=DEVICE)
+        if ckpt.get("res_scale") is not None and ckpt["res_scale"] != cfg.res_scale:
+            raise ValueError(f"--init-from checkpoint has res_scale={ckpt['res_scale']} but this "
+                             f"run uses {cfg.res_scale}; res_scale is not a learned parameter, so "
+                             f"load_state_dict would accept the mismatch silently and every "
+                             f"attention group would contribute the wrong residual magnitude.")
+        model.load_state_dict(ckpt["model"])
+        # The uncertainty head is loaded only if its architecture matches -- `use_edge_features`
+        # changes the first conv's in_channels, so a checkpoint from the other variant cannot be
+        # loaded and the head simply trains from scratch. It is a small, fast-converging module
+        # and is decoupled from the core (see the pred.detach() below), so this costs little.
+        try:
+            uncertainty_head.load_state_dict(ckpt["uncertainty_head"])
+        except (RuntimeError, KeyError) as exc:
+            logger.warning(f"uncertainty head not loaded from --init-from ({exc.__class__.__name__}"
+                           f"); training it from scratch.")
+        logger.info(f"warm start from {init_from} (weights only; fresh optimiser and schedule)")
+
+    # Resume. Colab sessions disconnect; without this, a run that dies at epoch 15 of 25 restarts
+    # from scratch and the compute already spent is simply gone. Restoring the model alone is NOT
+    # enough and would be quietly wrong in two ways: Adam's first/second moment estimates would
+    # restart at zero (so the first steps after a resume take badly-scaled updates), and the
+    # cosine schedule would restart at the initial LR (undoing the decay already served). Both
+    # optimiser and scheduler state are therefore saved and restored alongside the weights.
+    if resume:
+        if not os.path.exists(resume):
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume}")
+        ckpt = torch.load(resume, map_location=DEVICE)
+        if ckpt.get("config") != config_name:
+            raise ValueError(f"--resume checkpoint was trained with config={ckpt.get('config')}, "
+                             f"but this run specifies config={config_name}")
+        if ckpt.get("res_scale") is not None and ckpt["res_scale"] != cfg.res_scale:
+            raise ValueError(f"--resume checkpoint has res_scale={ckpt['res_scale']}, but this "
+                             f"run uses {cfg.res_scale}. res_scale is not a learned parameter, "
+                             f"so load_state_dict would accept the mismatch silently.")
+        model.load_state_dict(ckpt["model"])
+        uncertainty_head.load_state_dict(ckpt["uncertainty_head"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        else:
+            logger.warning("--resume checkpoint has no optimizer state (written before resume "
+                           "support); Adam moments restart cold.")
+        if scheduler is not None and ckpt.get("scheduler") is not None:
+            if ckpt.get("epochs") is not None and ckpt["epochs"] != epochs:
+                raise ValueError(
+                    f"--resume checkpoint was trained with --epochs {ckpt['epochs']}, but this "
+                    f"run specifies {epochs}. The cosine schedule's T_max is the epoch count, so "
+                    f"restoring its state into a different-length schedule produces an LR curve "
+                    f"matching neither run. Re-run with --epochs {ckpt['epochs']}, or add "
+                    f"--no-lr-schedule to opt out of the schedule entirely.")
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_total = ckpt.get("best_val_total", ckpt.get("val_total_loss", float("inf")))
+        global_step_resumed = ckpt.get("global_step", 0)
+        logger.info(f"resumed from {resume}: starting at epoch {start_epoch}, "
+                    f"best_val_total={best_val_total:.4f}")
+    else:
+        global_step_resumed = 0
+
+    # Intra-epoch validation. Per-epoch logging gave run 10 only 20 points across 45,620
+    # iterations, which is too coarse to see anything forming: the epoch-1 PSNR collapse
+    # (21.10 -> 18.70) was only visible 16 minutes after it began. Validating a small fixed
+    # subset every N steps gives a dense curve for a small fraction of the cost, and makes a
+    # divergence visible while there is still time to kill the run.
+    #
+    # The subset is a FIXED prefix of the held-out set, so successive points are comparable to
+    # each other; the full held-out set is still scored at every epoch boundary, and only those
+    # full evaluations drive checkpoint selection. Step records carry "step_eval": true so the
+    # two are never mixed when plotting or when picking a best checkpoint.
+    step_loader = None
+    if val_every_n_steps > 0:
+        step_subset = torch.utils.data.Subset(
+            val_dataset, range(min(step_val_tiles, len(val_dataset))))
+        step_loader = torch.utils.data.DataLoader(step_subset, batch_size=batch_size,
+                                                   shuffle=False)
+        logger.info(f"intra-epoch validation: every {val_every_n_steps} steps on "
+                    f"{len(step_subset)} tiles (full {len(val_dataset)}-tile eval at epoch end)")
+    global_step = global_step_resumed
+
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
         # Train side: loss terms + grad_norm only, tracked per-batch and averaged -- NOT
         # accuracy metrics (PSNR/SSIM/downstream), which are deliberately val-only. Running
@@ -256,6 +396,22 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             train_totals["nll"] += float(nll)
             grad_norms.append(float(grad_norm))
             n_batches += 1
+            global_step += 1
+
+            if step_loader is not None and global_step % val_every_n_steps == 0:
+                step_val = _run_validation(model, uncertainty_head, criterion, degradation,
+                                            step_loader)
+                step_record = {
+                    "step_eval": True, "global_step": global_step, "epoch": epoch,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "train_total_loss": float(loss_terms["total"]),
+                    **{f"val_{k}": v for k, v in step_val.items()},
+                }
+                with open(epoch_log_path, "a") as f:
+                    f.write(json.dumps(step_record) + "\n")
+                logger.info(f"    step {global_step:>6}  val_psnr={step_val['psnr']:.3f}  "
+                            f"val_loss={step_val['total_loss']:.4f}  "
+                            f"val_ssim={step_val['ssim_metric']:.4f}")
 
         train_avg = {k: v / max(n_batches, 1) for k, v in train_totals.items()}
         val_avg = _run_validation(model, uncertainty_head, criterion, degradation, val_loader)
@@ -265,6 +421,7 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             scheduler.step()
 
         record = {
+            "step_eval": False, "global_step": global_step,
             "epoch": epoch, "epoch_seconds": epoch_time, "lr": current_lr,
             "grad_norm_mean": sum(grad_norms) / max(len(grad_norms), 1),
             "grad_norm_max": max(grad_norms) if grad_norms else 0.0,
@@ -285,6 +442,17 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             # for real: run10 was trained at res_scale=0.2, and reloading it under the config
             # default of 0.1 produced near-black predictions.
             "res_scale": cfg.res_scale,
+            # Everything below exists so --resume can restart mid-run correctly rather than
+            # merely reloading weights. See the resume block above for why each is required.
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "best_val_total": min(best_val_total, val_avg["total_loss"]),
+            "global_step": global_step,
+            # Recorded so --resume can detect a changed --epochs. CosineAnnealingLR is
+            # parameterised by T_max=epochs; resuming a 60-epoch schedule under --epochs 80
+            # restores last_epoch into a schedule with a different period, and the LR then
+            # follows a curve that matches neither run -- silently, with no error.
+            "epochs": epochs,
         }
 
         # Rolling window, not "keep every epoch forever" -- COLAB_REALISTIC checkpoints are
@@ -304,6 +472,16 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             best_val_total = val_avg["total_loss"]
             torch.save(checkpoint_state, best_checkpoint_path)
             logger.info(f"  new best val_total_loss={best_val_total:.4f} -> {best_checkpoint_path}")
+
+        # Off-machine backup. Local checkpoints do not survive a Colab session ending, so on a
+        # long run the only durable copy is the remote one. Deliberately pushes just the two
+        # files worth keeping (this epoch's + the best so far) rather than the whole run dir --
+        # the rolling window means most of that directory is unchanged from the previous push.
+        if hf_backup_every_n_epochs and (epoch + 1) % hf_backup_every_n_epochs == 0:
+            from hf_checkpoint import backup_checkpoint
+            if backup_checkpoint([checkpoint_path, best_checkpoint_path, epoch_log_path],
+                                 subdir=os.path.basename(out_dir.rstrip("/\\"))):
+                logger.info(f"  backed up epoch {epoch} to HF Hub")
 
         logger.info(
             f"epoch {epoch}/{epochs - 1} ({epoch_time:.1f}s) "
@@ -345,7 +523,9 @@ if __name__ == "__main__":
                         "original 0.3 default after visualize_predictions.py showed the model "
                         "converging to bicubic-equivalent blurry output -- 0.3 wasn't strong "
                         "enough to escape that basin.")
-    p.add_argument("--data-source", choices=["naip_synthetic", "sen2naip"], default="naip_synthetic",
+    p.add_argument("--data-source",
+                   choices=["naip_synthetic", "sen2naip", "sen2naip_synthetic"],
+                   default="naip_synthetic",
                    help="'naip_synthetic': real NAIP HR + our own DegradationOperator's "
                         "synthetic LR (the original pretrain approach). 'sen2naip': real, "
                         "same-day-acquired Sentinel-2/NAIP pairs from the SEN2NAIP cross-sensor "
@@ -368,17 +548,84 @@ if __name__ == "__main__":
                         "the term that inverts the blur incentive: measured on real NAIP, "
                         "charbonnier scores a blurry candidate BETTER than a sharp one shifted by "
                         "1px (0.032 vs 0.039) while this loss scores it worse (1.584 vs 1.193).")
+    p.add_argument("--val-every-n-steps", type=int, default=0,
+                   help="Validate a small held-out subset every N optimizer steps "
+                        "(0 = off). Per-epoch logging alone gave run 10 just 20 "
+                        "points over 45,620 iterations -- too coarse to see a "
+                        "divergence forming. Records carry step_eval=true; the full "
+                        "held-out set is still scored at every epoch boundary and is "
+                        "the only thing that selects checkpoints.")
+    p.add_argument("--step-val-tiles", type=int, default=64,
+                   help="Tiles in the intra-epoch subset. Fixed prefix of the "
+                        "held-out set so successive points are comparable.")
+    p.add_argument("--w-sam", type=float, default=0.3,
+                   help="Spectral angle loss weight. Raising this and --w-index targets the "
+                        "measured weakness: with radiometry equalised, the model is only TIED "
+                        "with bicubic on NDVI (+0.0013), i.e. its extra spatial detail buys no "
+                        "spectral accuracy. At 0.3/0.2 against charbonnier 1.0 the objective "
+                        "is dominated by pixel fidelity.")
+    p.add_argument("--w-index", type=float, default=0.2,
+                   help="NDVI/NDWI preservation loss weight. See --w-sam.")
     p.add_argument("--res-scale", type=float, default=None,
                    help="EDSR-style residual scaling per attention group. Without it, "
                         "activations compounded ~2x per group and killed the residual branch "
                         "outright (measured). Swept on the fast capacity diagnostic.")
     p.add_argument("--qa2-max", type=float, default=None,
                    help="Max SEN2NAIP spectral angle distance (degrees) to keep. Median 1.131.")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Checkpoint to resume from. Restores model, uncertainty head, optimiser "
+                        "moments, LR-schedule position, best-so-far val loss and global step -- "
+                        "reloading weights alone would silently restart Adam and the cosine "
+                        "schedule from zero.")
+    p.add_argument("--sen2naip-variant", choices=["v1", "v2"], default="v1",
+                   help="Which SEN2NAIP cross-sensor release --sen2naip-dir points at. Selects "
+                        "tile geometry (v1 484/121, v2 520/130), HR scaling (v1 is uint8 NAIP "
+                        "/255, v2 is uint16 Sentinel-2 reflectance /10000) and whether "
+                        "radiometric calibration is applied (v2's HR is already harmonized). "
+                        "Getting this wrong is SILENT: the v1 rule applied to v2 overshoots HR "
+                        "by ~40x and trains on nonsense without raising anything.")
+    p.add_argument("--sen2naip-synthetic-dir", type=str, default="data/raw/sen2naip/synthetic",
+                   help="Root of the extracted SEN2NAIP synthetic component (ROI_*/early|late/"
+                        "*.tif). HR NAIP only -- the LR side is simulated, so this is "
+                        "pretraining volume, not evaluation data.")
+    p.add_argument("--sen2naip-synthetic-era", choices=["early", "late", "both"], default="both",
+                   help="Which acquisitions to use. 'both' treats the two dates as independent "
+                        "HR tiles; the train/val split is always by ROI so the same ground never "
+                        "appears on both sides.")
+    p.add_argument("--init-from", type=str, default=None,
+                   help="Warm-start from a checkpoint's WEIGHTS only, starting a fresh run at "
+                        "epoch 0 with a fresh optimiser and LR schedule. Use this to fine-tune "
+                        "(e.g. synthetic-pretrained -> real cross-sensor) or to sweep loss "
+                        "weights from an already-converged core. Use --resume instead to "
+                        "continue an interrupted run.")
+    p.add_argument("--hf-backup-every-n-epochs", type=int, default=0,
+                   help="Push the current + best checkpoint to HF Hub every N epochs (0 = off). "
+                        "Requires SPECTRA_SR_HF_REPO and HF_TOKEN; verify with "
+                        "`python scripts/hf_checkpoint.py check` BEFORE starting a long run. "
+                        "A failed upload logs a warning and never kills training.")
     args = p.parse_args()
 
-    train(args.config, args.epochs, args.batch_size, args.out, args.naip_dir, args.seed,
-          args.val_fraction, args.keep_last_n, args.lr, args.grad_clip_norm,
-          not args.no_lr_schedule, args.w_gradient, args.w_perceptual, args.data_source,
-          args.sen2naip_dir,
-          args.sen2naip_train_crops, args.sen2naip_val_crops, args.qa1_max, args.qa2_max,
-          args.res_scale)
+    # Keyword arguments throughout, deliberately. This call was positional and `train`'s
+    # signature has grown past 25 parameters; inserting one in the middle silently shifted every
+    # later argument by one position, with types compatible enough that nothing raised -- the
+    # SEN2NAIP directory would simply have been passed as a different directory parameter.
+    # Keywords make the signature order irrelevant.
+    train(config_name=args.config, epochs=args.epochs, batch_size=args.batch_size,
+          out_dir=args.out, naip_dir=args.naip_dir, seed=args.seed,
+          val_fraction=args.val_fraction, keep_last_n=args.keep_last_n,
+          lr=args.lr, grad_clip_norm=args.grad_clip_norm,
+          use_lr_schedule=not args.no_lr_schedule,
+          w_gradient=args.w_gradient, w_perceptual=args.w_perceptual,
+          w_sam=args.w_sam, w_index=args.w_index,
+          data_source=args.data_source,
+          sen2naip_synthetic_dir=args.sen2naip_synthetic_dir,
+          sen2naip_synthetic_era=args.sen2naip_synthetic_era,
+          sen2naip_dir=args.sen2naip_dir,
+          sen2naip_train_crops=args.sen2naip_train_crops,
+          sen2naip_val_crops=args.sen2naip_val_crops,
+          sen2naip_variant=args.sen2naip_variant,
+          qa1_max=args.qa1_max, qa2_max=args.qa2_max,
+          res_scale=args.res_scale,
+          val_every_n_steps=args.val_every_n_steps, step_val_tiles=args.step_val_tiles,
+          resume=args.resume, hf_backup_every_n_epochs=args.hf_backup_every_n_epochs,
+          init_from=args.init_from)

@@ -27,6 +27,32 @@ import torch.nn.functional as F
 from .degradation import DegradationOperator
 
 
+def _edge_features(x: torch.Tensor) -> list:
+    """Two full-resolution, band-aggregated spatial descriptors of `x`: gradient magnitude and
+    local standard deviation. Each returned as (B, 1, H, W).
+
+    Deliberately parameter-free and computed from the prediction alone, so the head gains
+    high-frequency spatial context without any extra learned weights and without needing
+    information unavailable at inference time.
+    """
+    import torch.nn.functional as F  # local import: keeps module import cost off the hot path
+
+    gray = x.mean(dim=1, keepdim=True)
+    kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+                      dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+    padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+    gx = F.conv2d(padded, kx)
+    gy = F.conv2d(padded, kx.transpose(-1, -2))
+    # +1e-6 inside the sqrt: sqrt has unbounded gradient at 0 and flat regions (gx=gy=0) are
+    # common in real imagery -- the same singularity already guarded against in losses.py.
+    grad = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+
+    mean = F.avg_pool2d(gray, 5, stride=1, padding=2)
+    var = F.avg_pool2d(gray ** 2, 5, stride=1, padding=2) - mean ** 2
+    local_std = torch.sqrt(var.clamp_min(0) + 1e-6)
+    return [grad, local_std]
+
+
 class UncertaintyHead(nn.Module):
     """Predicts per-pixel log-variance from (prediction, re-degradation residual). A small conv
     stack, not a full second HAT core -- this is meant to be cheap relative to Stage 3.
@@ -41,11 +67,16 @@ class UncertaintyHead(nn.Module):
     the correct left/right pattern -- clamping is not a defensive nicety, it's required.
     """
 
-    def __init__(self, n_bands: int, hidden: int = 32, log_var_range: tuple = (-8.0, 8.0)):
+    def __init__(self, n_bands: int, hidden: int = 32, log_var_range: tuple = (-8.0, 8.0),
+                 use_edge_features: bool = True):
         super().__init__()
         self.log_var_range = log_var_range
+        self.use_edge_features = use_edge_features
+        # Input channels: prediction, upsampled residual, and (optionally) two full-resolution
+        # edge features -- see forward() for why those matter.
+        in_ch = n_bands * 2 + (2 if use_edge_features else 0)
         self.net = nn.Sequential(
-            nn.Conv2d(n_bands * 2, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, hidden, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(hidden, n_bands, 3, padding=1),
         )
@@ -53,9 +84,29 @@ class UncertaintyHead(nn.Module):
     def forward(self, pred: torch.Tensor, residual_upsampled: torch.Tensor) -> torch.Tensor:
         """Returns log-variance, same shape as `pred`. Not variance directly -- predicting
         log-variance and exponentiating is the standard heteroscedastic-NLL trick that keeps
-        the network from ever having to represent a negative variance."""
-        x = torch.cat([pred, residual_upsampled], dim=1)
-        raw = self.net(x)
+        the network from ever having to represent a negative variance.
+
+        `use_edge_features` addresses a measured structural limitation. The only spatial signal
+        this head originally received was `residual_upsampled`, which is the re-degradation
+        residual computed at LR resolution (96x96) and nearest-upsampled to HR (384x384). Every
+        4x4 output block therefore shares one residual value, so the head is *incapable* of
+        localising error at a finer scale than the input grid -- yet super-resolution error is
+        concentrated exactly at fine edges. Measured consequence: the predicted uncertainty map
+        correlated only r=0.19 with actual error, and was anti-correlated on 19% of scenes,
+        despite being well calibrated in magnitude (ECE 0.030).
+
+        The two added channels are computed from `pred` itself at full resolution, so they carry
+        genuine high-frequency structure:
+          * gradient magnitude -- SR error concentrates at edges, which this locates directly.
+          * local standard deviation -- separates textured regions (where the model is
+            interpolating plausible detail) from flat ones (where it is nearly copying).
+        Both are derived from the prediction alone and need no extra ground truth, so they are
+        available at inference exactly as they are during training.
+        """
+        feats = [pred, residual_upsampled]
+        if self.use_edge_features:
+            feats.extend(_edge_features(pred))
+        raw = self.net(torch.cat(feats, dim=1))
         return torch.clamp(raw, *self.log_var_range)
 
 

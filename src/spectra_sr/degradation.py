@@ -185,8 +185,31 @@ class AcceptanceResult:
     per_band_threshold: Tuple[float, ...]
 
 
-# PLACEHOLDER -- not sourced from ESA's Sentinel-2 User Handbook yet. Do not treat as a real,
-# published NEDeltaRho value. Replace per-band before running the acceptance test on real data.
+# PLACEHOLDER -- STILL NOT SOURCED. Do not treat as a real, published NEDeltaRho value, do not
+# quote it in a report, and do not present a guardrail pass/fail based on it as evidence of
+# anything. A single scalar reused across all four bands is additionally wrong in shape: the real
+# quantity differs per band, because SNR and reference radiance both do.
+#
+# An attempt to source it (2026-08-28) failed: sentinel.esa.int did not resolve, the Copernicus
+# SentiWiki Data Quality Report PDF returned 404, and the ResearchGate figure carrying the table
+# was not machine-readable. Rather than substitute half-remembered numbers -- which would be worse
+# than this placeholder, since a wrong value labelled "ESA specification" looks authoritative --
+# the gap is left open and documented.
+#
+# TO CLOSE THIS, obtain any one of:
+#   * Sentinel-2 Products Specification Document, ref S2-PDGS-CS-DI-PSD (latest is v15.0, 2024)
+#   * Sentinel-2 MSI L1C Data Quality Report (monthly, OMPC.CS.DQR.001.*) -- carries measured
+#     SNR@Lref per band for both S2A and S2B, which is better than the requirement value
+#   * ESA Sentinel-2 MSI Technical Guide, "Mission Performance" page
+#
+# and extract, for B02/B03/B04/B08: the reference radiance Lref (W/m^2/sr/um) and the SNR at that
+# radiance. Then convert to a noise-equivalent reflectance difference per band:
+#
+#     NEDeltaRho_b  =  rho_ref_b / SNR@Lref_b
+#
+# where rho_ref_b is the top-of-atmosphere reflectance corresponding to Lref_b. Replace this
+# constant with that per-band tuple and re-run the guardrails; until then a guardrail FAIL means
+# only "differs from an arbitrary 0.005", not "exceeds sensor noise".
 PLACEHOLDER_NEDRHO = 0.005
 
 

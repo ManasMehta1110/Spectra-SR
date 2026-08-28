@@ -57,6 +57,9 @@ def main():
     p.add_argument("--res-scale", type=float, default=None)
     p.add_argument("--cosine", action="store_true",
                    help="cosine-decay the LR to 0 over --steps")
+    p.add_argument("--sen2naip-variant", choices=["v1", "v2"], default="v1",
+                   help="Which SEN2NAIP release --sen2naip-dir points at; see "
+                        "sen2naip_dataset.DATASET_VARIANTS. Wrong values fail silently.")
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -71,7 +74,8 @@ def main():
     # crops_per_file=1 and a fixed seed: we want the SAME few patches every step, so this is
     # genuine memorization rather than a slowly-refreshed stream of new crops.
     ds = SEN2NAIPCrossSensorDataset(args.sen2naip_dir, hr_patch_size=hr_patch,
-                                     crops_per_file=1, roi_list=rois, seed=args.seed)
+                                     crops_per_file=1, roi_list=rois, seed=args.seed,
+                                     variant=args.sen2naip_variant)
     lrs, hrs = [], []
     for i in range(len(ds)):
         lo, hi = ds[i]

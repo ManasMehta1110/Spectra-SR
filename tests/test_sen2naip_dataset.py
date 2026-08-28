@@ -127,3 +127,149 @@ def test_dataloader_batches_real_data_end_to_end():
     assert lr_batch.shape == (4, 4, 16, 16)
     assert hr_batch.shape == (4, 4, 64, 64)
     assert torch.isfinite(lr_batch).all() and torch.isfinite(hr_batch).all()
+
+
+def _make_synthetic_tree(root, n_rois=10):
+    """Minimal stand-in for the SEN2NAIP synthetic component's layout: ROI_*/early|late/*.tif."""
+    import numpy as np
+    import rasterio
+    for i in range(n_rois):
+        for era in ("early", "late"):
+            d = os.path.join(root, f"ROI_{i:04d}", era)
+            os.makedirs(d)
+            path = os.path.join(d, f"{era}__tile{i}.tif")
+            with rasterio.open(path, "w", driver="GTiff", height=8, width=8, count=4,
+                               dtype="uint8") as dst:
+                dst.write(np.full((4, 8, 8), i, dtype=np.uint8))
+    return root
+
+
+def test_synthetic_split_is_by_roi_so_paired_eras_never_straddle_it(tmp_path):
+    """The two eras of one ROI cover the SAME ground a decade apart. Splitting per-file would
+    put the 2011 image of a field in train and the 2021 image of that same field in val, and the
+    val score would then be inflated by near-duplicate leakage rather than measuring
+    generalization. The split must therefore be by ROI."""
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    root = _make_synthetic_tree(str(tmp_path / "synthetic"))
+    train, val = synthetic_component_files(root, era="both", val_fraction=0.2)
+
+    def rois(paths):
+        return {os.path.basename(os.path.dirname(os.path.dirname(p))) for p in paths}
+
+    assert rois(train) & rois(val) == set(), "an ROI appeared on both sides of the split"
+    assert len(train) + len(val) == 20  # 10 ROIs x 2 eras
+    # Both eras of any given ROI land together.
+    for roi in rois(val):
+        assert sum(1 for p in val if roi in p) == 2
+
+
+def test_synthetic_era_selection_halves_the_file_count(tmp_path):
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    root = _make_synthetic_tree(str(tmp_path / "synthetic"))
+    both_train, both_val = synthetic_component_files(root, era="both")
+    early_train, early_val = synthetic_component_files(root, era="early")
+    assert len(both_train) + len(both_val) == 2 * (len(early_train) + len(early_val))
+    assert all("early" in os.path.dirname(p) for p in early_train + early_val)
+
+
+def test_synthetic_split_is_deterministic_across_calls(tmp_path):
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    root = _make_synthetic_tree(str(tmp_path / "synthetic"))
+    first = synthetic_component_files(root, era="both")
+    second = synthetic_component_files(root, era="both")
+    assert first == second
+
+
+def test_synthetic_rejects_unknown_era(tmp_path):
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    root = _make_synthetic_tree(str(tmp_path / "synthetic"))
+    with pytest.raises(ValueError, match="era must be"):
+        synthetic_component_files(root, era="middle")
+
+
+def test_synthetic_finds_rois_inside_extracted_shard_subdirectories(tmp_path):
+    """Each shard extracts to its own subdirectory (`synthetic_01.zip` -> `synthetic_1/ROI_*/`),
+    so the directory the shards were extracted into holds shard dirs, not ROI dirs. Pointing at
+    that parent is the obvious thing to do, and before this it failed with a confusing "no ROI
+    dirs" error after a 10 GB download."""
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    root = str(tmp_path / "synthetic")
+    os.makedirs(root)
+    _make_synthetic_tree(os.path.join(root, "synthetic_1"), n_rois=6)
+    _make_synthetic_tree(os.path.join(root, "synthetic_2"), n_rois=6)
+
+    train, val = synthetic_component_files(root, era="both", val_fraction=0.2)
+    # _make_synthetic_tree numbers ROIs from 0 in each shard, so the two shards collide here by
+    # construction; real ROI ids are globally unique (shard 01 alone spans 1..104577). What is
+    # asserted is that ROIs below the shard level are found at all, and that the split still
+    # partitions cleanly.
+    assert len(train) + len(val) > 0
+    assert set(train).isdisjoint(val)
+
+
+def test_synthetic_still_works_when_pointed_directly_at_a_shard(tmp_path):
+    from spectra_sr.sen2naip_dataset import synthetic_component_files
+    shard = _make_synthetic_tree(str(tmp_path / "synthetic_1"), n_rois=10)
+    train, val = synthetic_component_files(shard, era="both", val_fraction=0.2)
+    assert len(train) + len(val) == 20
+
+
+def _make_v2_pair(root, n_rois=6):
+    """Stand-in for the SEN2NAIPv2 layout: 520/130 px tiles, uint16 for BOTH lr and hr."""
+    import numpy as np
+    import rasterio
+    for i in range(n_rois):
+        d = os.path.join(root, f"ROI_{i:05d}")
+        os.makedirs(d)
+        for name, size in (("lr", 130), ("hr", 520)):
+            with rasterio.open(os.path.join(d, f"{name}.tif"), "w", driver="GTiff",
+                               height=size, width=size, count=4, dtype="uint16") as dst:
+                dst.write(np.full((4, size, size), 1500, dtype=np.uint16))
+    return root
+
+
+def test_v2_scales_hr_by_10000_not_255(tmp_path):
+    """The single most dangerous difference between the releases. v1's HR is uint8 NAIP (/255);
+    v2's is uint16 already in Sentinel-2 reflectance units (/10000). Applying the v1 rule to v2
+    overshoots by ~40x and nothing raises -- the images are simply wrong."""
+    from spectra_sr.sen2naip_dataset import SEN2NAIPCrossSensorDataset
+    root = _make_v2_pair(str(tmp_path / "v2"))
+    ds = SEN2NAIPCrossSensorDataset(root, hr_patch_size=384, crops_per_file=1, seed=0,
+                                    variant="v2")
+    lr, hr = ds[0]
+    assert abs(float(hr.mean()) - 0.15) < 1e-4, "hr should be 1500/10000, not 1500/255"
+    assert abs(float(lr.mean()) - 0.15) < 1e-4
+    # Both sides land on the same radiometric scale, which is the point of v2's harmonization.
+    assert abs(float(hr.mean() / lr.mean()) - 1.0) < 1e-3
+
+
+def test_v2_disables_radiometric_calibration_by_default(tmp_path):
+    """v2's HR is already harmonized to the Sentinel-2 scale (measured per-band HR/LR ratios
+    1.000/0.999/0.999/1.000). Applying v1's affine calibration would INTRODUCE the error it
+    exists to remove, so the default must come from the variant, not from a fixed default."""
+    from spectra_sr.sen2naip_dataset import SEN2NAIPCrossSensorDataset
+    root = _make_v2_pair(str(tmp_path / "v2"))
+    assert SEN2NAIPCrossSensorDataset(root, hr_patch_size=384, crops_per_file=1,
+                                      variant="v2").radiometric_calibration is False
+    # ...but an explicit argument still wins, so the flag stays testable.
+    assert SEN2NAIPCrossSensorDataset(root, hr_patch_size=384, crops_per_file=1, variant="v2",
+                                      radiometric_calibration=True).radiometric_calibration is True
+
+
+def test_v2_uses_its_own_tile_geometry(tmp_path):
+    from spectra_sr.sen2naip_dataset import SEN2NAIPCrossSensorDataset
+    root = _make_v2_pair(str(tmp_path / "v2"))
+    ds = SEN2NAIPCrossSensorDataset(root, hr_patch_size=520, crops_per_file=1, variant="v2")
+    assert (ds.hr_tile_size, ds.lr_tile_size) == (520, 130)
+    lr, hr = ds[0]
+    assert hr.shape[-1] == 520 and lr.shape[-1] == 130
+    # 520 exceeds v1's 484 tile, so the same request must be rejected under v1.
+    with pytest.raises(ValueError, match="exceeds the v1 tile size"):
+        SEN2NAIPCrossSensorDataset(root, hr_patch_size=520, crops_per_file=1, variant="v1")
+
+
+def test_unknown_variant_is_rejected(tmp_path):
+    from spectra_sr.sen2naip_dataset import SEN2NAIPCrossSensorDataset
+    root = _make_v2_pair(str(tmp_path / "v2"))
+    with pytest.raises(ValueError, match="variant must be one of"):
+        SEN2NAIPCrossSensorDataset(root, hr_patch_size=384, variant="v3")

@@ -80,7 +80,8 @@ def _iter_sen2naip(args, cfg, hr_patch_size):
     print(f"Held-out val ROIs ({len(val_rois)}), showing first {args.n_samples}")
 
     ds = SEN2NAIPCrossSensorDataset(args.sen2naip_dir, hr_patch_size=hr_patch_size,
-                                     crops_per_file=1, roi_list=val_rois, seed=args.seed)
+                                     crops_per_file=1, roi_list=val_rois, seed=args.seed,
+                                     variant=args.sen2naip_variant)
     for i, roi in enumerate(val_rois[:args.n_samples]):
         lr, hr = ds[i]
         yield roi, lr.unsqueeze(0).to(DEVICE), hr.unsqueeze(0).to(DEVICE)
@@ -102,6 +103,9 @@ def main():
     p.add_argument("--res-scale", type=float, default=None,
                    help="Override res_scale. Only needed for checkpoints saved "
                         "before res_scale was recorded in the checkpoint itself.")
+    p.add_argument("--sen2naip-variant", choices=["v1", "v2"], default="v1",
+                   help="Which SEN2NAIP release --sen2naip-dir points at; see "
+                        "sen2naip_dataset.DATASET_VARIANTS. Wrong values fail silently.")
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)

@@ -1,0 +1,69 @@
+=== arm control: w_sam=0.3 w_index=0.2 ===
+2026-08-28 14:44:03,628 [INFO] config=colab_realistic res_scale=0.2 embed_dim=112 groups=4x4 patch=96
+2026-08-28 14:44:04,352 [INFO] SEN2NAIP: 2281 train ROIs, 570 held-out val ROIs
+2026-08-28 14:44:04,352 [INFO] Val ROIs (never trained on): 570 ROIs, first 10: ['ROI_0000', 'ROI_0005', 'ROI_0010', 'ROI_0015', 'ROI_0020', 'ROI_0025', 'ROI_0030', 'ROI_0035', 'ROI_0040', 'ROI_0045']
+2026-08-28 14:44:04,419 [INFO] loss weights: charbonnier=1.0 ssim=0.2 sam=0.3 index=0.2 cycle=0.5 gradient=0.3 perceptual=0.0
+2026-08-28 14:44:05,947 [WARNING] uncertainty head not loaded from --init-from (RuntimeError); training it from scratch.
+2026-08-28 14:44:05,947 [INFO] warm start from checkpoints/pretrain_run10/checkpoint_best.pt (weights only; fresh optimiser and schedule)
+C:\Projects\spectra-sr\scripts\train_pretrain.py:375: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  train_totals["charbonnier"] += float(loss_terms["charbonnier"])
+2026-08-28 15:16:41,715 [INFO]   new best val_total_loss=0.2247 -> checkpoints/sweep_control\checkpoint_best.pt
+2026-08-28 15:16:41,715 [INFO] epoch 0/2 (1955.4s) train_loss=0.2237 val_loss=0.2247 val_psnr=22.16 val_ssim=0.6546 val_downstream_improvement=+0.0158 -> checkpoints/sweep_control\checkpoint_epoch0.pt
+2026-08-28 15:48:08,564 [INFO] epoch 1/2 (1886.7s) train_loss=0.2196 val_loss=0.2273 val_psnr=22.05 val_ssim=0.6547 val_downstream_improvement=+0.0128 -> checkpoints/sweep_control\checkpoint_epoch1.pt
+2026-08-28 16:19:11,177 [INFO]   new best val_total_loss=0.2207 -> checkpoints/sweep_control\checkpoint_best.pt
+2026-08-28 16:19:11,177 [INFO] epoch 2/2 (1862.3s) train_loss=0.2161 val_loss=0.2207 val_psnr=22.43 val_ssim=0.6574 val_downstream_improvement=+0.0166 -> checkpoints/sweep_control\checkpoint_epoch2.pt
+2026-08-28 16:19:11,177 [INFO] Training done. Per-epoch checkpoints + checkpoints/sweep_control\epoch_log.jsonl saved to checkpoints/sweep_control
+=== arm mid: w_sam=1.0 w_index=0.6 ===
+2026-08-28 16:19:15,830 [INFO] config=colab_realistic res_scale=0.2 embed_dim=112 groups=4x4 patch=96
+2026-08-28 16:19:16,572 [INFO] SEN2NAIP: 2281 train ROIs, 570 held-out val ROIs
+2026-08-28 16:19:16,572 [INFO] Val ROIs (never trained on): 570 ROIs, first 10: ['ROI_0000', 'ROI_0005', 'ROI_0010', 'ROI_0015', 'ROI_0020', 'ROI_0025', 'ROI_0030', 'ROI_0035', 'ROI_0040', 'ROI_0045']
+2026-08-28 16:19:16,639 [INFO] loss weights: charbonnier=1.0 ssim=0.2 sam=1.0 index=0.6 cycle=0.5 gradient=0.3 perceptual=0.0
+2026-08-28 16:19:17,995 [WARNING] uncertainty head not loaded from --init-from (RuntimeError); training it from scratch.
+2026-08-28 16:19:17,995 [INFO] warm start from checkpoints/pretrain_run10/checkpoint_best.pt (weights only; fresh optimiser and schedule)
+C:\Projects\spectra-sr\scripts\train_pretrain.py:389: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  train_totals["charbonnier"] += float(loss_terms["charbonnier"])
+2026-08-28 16:50:33,083 [INFO]   new best val_total_loss=0.3341 -> checkpoints/sweep_mid\checkpoint_best.pt
+2026-08-28 16:50:33,083 [INFO] epoch 0/2 (1874.8s) train_loss=0.3302 val_loss=0.3341 val_psnr=22.12 val_ssim=0.6544 val_downstream_improvement=+0.0171 -> checkpoints/sweep_mid\checkpoint_epoch0.pt
+2026-08-28 17:21:48,262 [INFO] epoch 1/2 (1875.0s) train_loss=0.3248 val_loss=0.3363 val_psnr=22.05 val_ssim=0.6547 val_downstream_improvement=+0.0146 -> checkpoints/sweep_mid\checkpoint_epoch1.pt
+2026-08-28 17:53:19,961 [INFO]   new best val_total_loss=0.3276 -> checkpoints/sweep_mid\checkpoint_best.pt
+2026-08-28 17:53:19,961 [INFO] epoch 2/2 (1891.4s) train_loss=0.3183 val_loss=0.3276 val_psnr=22.43 val_ssim=0.6567 val_downstream_improvement=+0.0171 -> checkpoints/sweep_mid\checkpoint_epoch2.pt
+2026-08-28 17:53:19,961 [INFO] Training done. Per-epoch checkpoints + checkpoints/sweep_mid\epoch_log.jsonl saved to checkpoints/sweep_mid
+=== arm high: w_sam=2.0 w_index=1.2 ===
+2026-08-28 17:53:24,993 [INFO] config=colab_realistic res_scale=0.2 embed_dim=112 groups=4x4 patch=96
+2026-08-28 17:53:25,717 [INFO] SEN2NAIP: 2281 train ROIs, 570 held-out val ROIs
+2026-08-28 17:53:25,717 [INFO] Val ROIs (never trained on): 570 ROIs, first 10: ['ROI_0000', 'ROI_0005', 'ROI_0010', 'ROI_0015', 'ROI_0020', 'ROI_0025', 'ROI_0030', 'ROI_0035', 'ROI_0040', 'ROI_0045']
+2026-08-28 17:53:25,781 [INFO] loss weights: charbonnier=1.0 ssim=0.2 sam=2.0 index=1.2 cycle=0.5 gradient=0.3 perceptual=0.0
+2026-08-28 17:53:27,177 [WARNING] uncertainty head not loaded from --init-from (RuntimeError); training it from scratch.
+2026-08-28 17:53:27,177 [INFO] warm start from checkpoints/pretrain_run10/checkpoint_best.pt (weights only; fresh optimiser and schedule)
+C:\Projects\spectra-sr\scripts\train_pretrain.py:389: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  train_totals["charbonnier"] += float(loss_terms["charbonnier"])
+2026-08-28 18:24:55,512 [INFO]   new best val_total_loss=0.4956 -> checkpoints/sweep_high\checkpoint_best.pt
+2026-08-28 18:24:55,512 [INFO] epoch 0/2 (1888.0s) train_loss=0.4870 val_loss=0.4956 val_psnr=22.03 val_ssim=0.6537 val_downstream_improvement=+0.0164 -> checkpoints/sweep_high\checkpoint_epoch0.pt
+2026-08-28 18:56:12,942 [INFO] epoch 1/2 (1877.3s) train_loss=0.4786 val_loss=0.4962 val_psnr=22.01 val_ssim=0.6538 val_downstream_improvement=+0.0151 -> checkpoints/sweep_high\checkpoint_epoch1.pt
+2026-08-28 19:27:26,348 [INFO]   new best val_total_loss=0.4845 -> checkpoints/sweep_high\checkpoint_best.pt
+2026-08-28 19:27:26,348 [INFO] epoch 2/2 (1873.1s) train_loss=0.4677 val_loss=0.4845 val_psnr=22.36 val_ssim=0.6558 val_downstream_improvement=+0.0170 -> checkpoints/sweep_high\checkpoint_epoch2.pt
+2026-08-28 19:27:26,348 [INFO] Training done. Per-epoch checkpoints + checkpoints/sweep_high\epoch_log.jsonl saved to checkpoints/sweep_high
+=== comparison ===
+control          3 epochs
+mid              3 epochs
+high             3 epochs
+
+metric                             control           mid          high
+----------------------------------------------------------------------
+val_psnr                          22.4335       22.4343*      22.3553 
+val_ssim_metric                    0.6574*       0.6567        0.6558 
+val_rmse                           0.0811*       0.0813        0.0821 
+val_sam_degrees                    4.5437        4.4097        4.3817*
+val_downstream_improvement         0.0166        0.0171*       0.0170 
+
+(* = best arm for that metric; each cell is that arm's BEST epoch, not its last.)
+
+Control arm 'control' drift (first -> best epoch) -- any arm that only matches this much movement has not beaten 'more training':
+  val_psnr                       22.1631 ->    22.4335  (+0.2704)
+  val_ssim_metric                 0.6546 ->     0.6574  (+0.0028)
+  val_rmse                        0.0835 ->     0.0811  (-0.0024)
+  val_sam_degrees                 4.6297 ->     4.5437  (-0.0861)
+  val_downstream_improvement      0.0158 ->     0.0166  (+0.0007)

@@ -259,6 +259,100 @@ invalidated runs 1-6. It does not establish a model whose output one would confi
 
 ---
 
+## Run 10 final (epoch 19): first model that consistently beats bicubic
+
+200 held-out ROIs, never trained on. `res_scale=0.2`, lr 2e-4 cosine, all 2,851 pairs.
+
+| | epoch 9 | **epoch 19** |
+|---|---|---|
+| bicubic PSNR | 21.07 | 21.011 |
+| SPECTRA-SR PSNR | 21.33 | **21.706** |
+| mean gain | +0.2672 dB | **+0.6948 dB** |
+| 95% CI | +0.11 to +0.42 | **+0.478 to +0.912** |
+| paired t-test | p = 1.0e-3 | **p = 2.2e-09** |
+| Wilcoxon | p = 5.0e-3 | **p = 1.5e-12** |
+| Cohen's d | 0.273 (small) | **0.444 (medium)** |
+| **win rate** | 52% | **74% (148/200)** |
+| edge correlation vs HR | +10.0% | **+11.7%** |
+
+The win rate is the meaningful number. At epoch 9 the mean gain was significant but the model beat
+bicubic on barely half of individual tiles -- a better average, not a better model. At epoch 19 it
+wins on roughly three of four.
+
+Per-band radiometric accuracy also beats bicubic (mean absolute band error 0.0574 vs 0.0627,
+better on all four bands), so the gain is not bought by distorting colour.
+
+**What this does not establish.** The downstream NDVI-classification metric remains negative
+(-0.0675): band *ratios* amplify the ~6% residual per-band error, so spectral fidelity is still
+the weak axis, and that metric maps most directly to the PS requirement. This is also a 3.57M-param
+model trained on US imagery -- the `FULL` config, real batch sizes, and Indian fine-tuning are all
+still ahead.
+
+---
+
+## Stage 5 (projection) and Stage 6 (calibration): both gates now measured
+
+Both existed as tested modules that no pipeline ever called. `inference.super_resolve()` now runs
+Stages 3/5/6/7 together and returns the image, its uncertainty map, and the guardrail verdict as
+one product.
+
+### Stage 5 -- the projection is a trade, not free
+
+200 held-out ROIs, run-10 epoch-19 checkpoint, `tikhonov_lambda=0.03`, `step=0.5`:
+
+| | model raw | + projection |
+|---|---|---|
+| mean PSNR | 21.706 dB | 21.549 dB (**-0.157**) |
+| win rate vs bicubic | 74.0% | **82.0%** |
+| consistency \|\|A(x)-y\|\| | 0.027582 | **0.014194 (-48.5%)** |
+
+It lowers the mean but raises the win rate by 8 points -- variance reduction, rescuing weak tiles
+more than it costs strong ones. Enabled by default: per-scene reliability and a defensible
+consistency claim matter more here than a mean.
+
+A **partial step is essential**. Full-strength projection (`step=1.0`) drives consistency to -88.8%
+but costs 0.178 dB, because Stage 0's operator is a placeholder (sigma=1.0, never fitted). A half
+step takes the part of the correction the real measurement actually informs and stops before the
+operator's own error dominates.
+
+**Caution against over-claiming**: an earlier 60-tile measurement showed the projection *improving*
+PSNR by +0.087 dB. At n=200 that reversed to -0.157 dB (p=0.0068). Sixty tiles was not enough.
+
+**Scope of the claim.** \|\|A(x)-y\|\| is measured with the same placeholder operator the projection
+uses, so it is partly circular. Defensible: *"provably consistent with the modelled sensor
+degradation."* Not yet defensible: *"consistent with what Sentinel-2 measured"* -- that needs Stage
+0's acceptance test against real data.
+
+### Stage 6 -- the head was over-confident; a scalar factor fixes it
+
+Plan Section 5's gate ("predicted confidence must actually track real error before this is
+presented as a feature") had never been run. 60 fit tiles, 60 **disjoint** test tiles:
+
+| | as trained | after recalibration |
+|---|---|---|
+| z_std (1.0 = calibrated) | **1.2513** | **1.0509** |
+| verdict | over-confident 1.25x | well calibrated |
+| ECE | 0.0888 | **0.0303** |
+| 1 sigma coverage (want 0.6827) | 0.5600 | 0.6445 |
+| 2 sigma coverage (want 0.9545) | 0.8899 | **0.9496** |
+| 3 sigma coverage (want 0.9973) | 0.9890 | **0.9976** |
+
+The head **understated real error by 25%** -- the dangerous direction, since it is exactly the
+inferred detail the PS asks to be flagged. A scalar factor of **1.1907**, fitted on a disjoint
+split, brings 2-sigma and 3-sigma coverage within 0.5 and 0.03 percentage points of theory.
+
+The factor is checkpoint-specific and defaults to 1.0 in `super_resolve()`: it must be measured per
+model with `scripts/calibrate_uncertainty.py`, never assumed.
+
+### Stage 7 -- runs, but thresholds are placeholders
+
+Guardrails now execute on real output and return per-check verdicts. On a sample held-out tile:
+spectral SAM passed (1.86 deg), geometric shift passed (0.05 px), radiometric RMSE and NDVI/NDWI
+delta failed. **That FAIL is not yet meaningful**: `PLACEHOLDER_NEDRHO = 0.005` has never been
+sourced from ESA's Sentinel-2 handbook. The mechanism is verified; the thresholds are not.
+
+---
+
 ## Method notes
 
 - **The capacity diagnostic should have come first.** `scripts/diagnose_model_capacity.py` asks
@@ -284,3 +378,219 @@ invalidated runs 1-6. It does not establish a model whose output one would confi
   itself and missed the radiometric calibration added later to the dataset, feeding the model
   input ~3x too dark and producing near-black output that looked like catastrophic model failure.
   Evaluation code must consume the same dataset class training does.
+
+## Pre-big-run checks: the model is underfit, not data-starved
+
+Measured to decide whether the next investment should be more data or more capacity, before
+committing a long Colab run to either.
+
+Run 10's train/val gap across all 20 epochs:
+
+| epoch | train | val | gap | gap % |
+|---|---|---|---|---|
+| 8 | 0.2003 | 0.2037 | +0.0034 | +1.7% |
+| 12 | 0.1947 | 0.1984 | +0.0037 | +1.9% |
+| 16 | 0.1903 | 0.1948 | +0.0045 | +2.4% |
+| 19 | 0.1875 | 0.1919 | +0.0044 | +2.4% |
+
+The gap is **stable at ~2% from epoch 8 onward — it is not widening** — and both train and val
+loss were still falling monotonically at epoch 19, with val PSNR still climbing (21.65 -> 21.79
+over the last three epochs). That is the signature of an underfit model, not an overfit one.
+
+Consequence for the plan: at COLAB_REALISTIC's 3.57M parameters, more data would not have been
+the binding constraint; capacity and training time are. **This does not generalize to FULL**,
+which is roughly 5x the parameters on the same 2,851 cross-sensor tiles -- a regime where
+overfitting becomes plausible and more data starts to matter. Pretraining data was therefore
+still acquired, but as insurance for the capacity increase rather than as a fix for run 10.
+
+### What the SEN2NAIP "synthetic" component actually is
+
+Worth recording because the name is misleading and the size (177 GB total, 18 shards) makes a
+wrong assumption expensive. Its metadata carries `s2_id: null`, `QA1: null`, `QA2: null`, and
+each ROI holds `early/<naip>.tif` and `late/<naip>.tif` at 1100x1100, 4-band uint8, 2.5m.
+
+**There is no Sentinel-2 imagery in it at all.** It is HR NAIP only; the LR side has to be
+simulated by our own degradation operator -- which is exactly what the existing
+`naip_synthetic` path already does. So it needs no new Dataset class, only a file-list helper
+(`synthetic_component_files`), and it feeds `NAIPPretrainDataset` unchanged.
+
+Two consequences:
+
+1. A model trained on it learns to invert a degradation *we chose*, which is an easier and
+   materially different task than the real cross-sensor one. Its role is pretraining volume
+   (plan Section 5, phase 3); the 2,851 real cross-sensor pairs remain the only honest basis for
+   any reported accuracy number.
+2. Per-ROI it carries 5.4x the pixel area of a cross-sensor tile (1100^2 vs 484^2), so a single
+   10 GB shard holds roughly 1.8x more unique HR pixel area than the entire cross-sensor set.
+   Volume is reachable without pulling all 177 GB.
+
+The train/val split for it is **by ROI, never by file**: the two eras cover the same ground a
+decade apart, so a per-file split would put the 2011 image of a field in train and the 2021
+image of that same field in val, inflating the val score with near-duplicate leakage. Covered
+by `test_synthetic_split_is_by_roi_so_paired_eras_never_straddle_it`.
+
+### Resume was missing, and weights-only resume would have been silently wrong
+
+`train_pretrain.py` had no resume path at all, so a Colab disconnect at epoch 15 of a 60-epoch
+run would have discarded all of it. Added `--resume`, but the checkpoint had to change too: it
+stored only model and uncertainty-head weights. Restoring those alone leaves
+
+* **Adam's moment estimates at zero**, so the first steps after a resume take badly-scaled
+  updates into an already-converged model, and
+* **the cosine schedule back at the initial LR**, undoing all decay already served.
+
+Both now round-trip, along with `best_val_total` and `global_step`. Verified by training two
+epochs, resuming, and confirming continuity with no loss discontinuity at the seam (a cold Adam
+restart shows a visible spike; this did not).
+
+A second, subtler footgun found while testing: `CosineAnnealingLR`'s `T_max` is the epoch count,
+so resuming a 60-epoch run under `--epochs 80` restores `last_epoch` into a schedule with a
+different period and produces an LR curve matching neither run, silently. The checkpoint now
+records `epochs` and `--resume` refuses on mismatch. The first resume test ran before this guard
+existed and hit exactly that case.
+
+`--init-from` is deliberately a separate flag: it loads weights only and starts a fresh run at
+epoch 0 with a fresh optimiser and schedule. Conflating the two would be wrong in both
+directions -- fine-tuning wants a fresh schedule at a new LR, resuming wants the original
+schedule continued.
+
+### Item 3 measured: edge features in the uncertainty head are a real but small win
+
+Testable cheaply because the head is decoupled from the core: `train_pretrain.py` feeds it
+`pred.detach()` and the NLL uses the detached prediction as its mean, so no gradient from the
+head reaches SpectraHATCore. The head is therefore strictly post-hoc and can be ablated against
+a FROZEN run-10 core -- isolating the one variable instead of confounding it with a differently
+trained core, and costing ~7 minutes per arm instead of a full retrain.
+(`scripts/ablate_uncertainty_head.py`; both arms: same frozen core, same seed, same data order,
+2000 steps, scored on 200 held-out ROIs the core never trained on.)
+
+| metric | baseline | edge | delta |
+|---|---|---|---|
+| per-tile corr, mean | 0.1580 | 0.1767 | +0.0187 |
+| per-tile corr, median | 0.1612 | 0.1889 | +0.0277 |
+| tiles positively correlated | 75.0% | 84.5% | +9.5 pp |
+| NLL | -1.8613 | -1.8477 | +0.0137 (worse) |
+| ECE recalibrated | 0.0313 | 0.0337 | +0.0025 (worse) |
+
+Paired over the same 200 tiles: mean delta +0.0187, 95% CI [+0.0062, +0.0311] (excludes zero),
+paired t p=3.70e-03, Wilcoxon p=2.20e-02, **Cohen's d 0.208, win rate 55.5%**.
+
+**Honest reading: statistically real, practically small.** d=0.208 with a 55.5% win rate means
+the effect holds in aggregate but barely beats a coin flip on any individual tile. Kept anyway,
+for a reason the mean does not capture: anti-correlated tiles fall from 25% to 15.5%, and an
+uncertainty map that points *away* from the error on a quarter of scenes is a liability for a
+problem statement that names uncertainty twice. The NLL/ECE cost is absorbed entirely by scalar
+recalibration (both arms end "well calibrated"), and the features are parameter-free at the
+input, costing 576 extra weights and no information unavailable at inference.
+
+A paired test is the only honest one here: between-tile variance in how predictable a scene's
+error is dwarfs the difference between the two heads, so an unpaired test would be badly
+underpowered and would report "no effect" regardless of the truth.
+
+### Incidental, and bigger than the effect being tested: train the head AFTER the core
+
+Both arms came out at recalibration factor **1.004-1.006** ("well calibrated" with no
+correction), against run 10's **1.19x over-confidence**. The only structural difference is that
+these heads were trained against a frozen core, while run 10's was co-trained with a core whose
+error distribution was still moving underneath it -- so run 10's head was fitting a moving
+target and ended up systematically over-confident.
+
+Recommendation for the big run: train the core, then fit the uncertainty head post-hoc against
+the frozen result. It removes the need for a recalibration step and costs one short extra pass.
+
+## SEN2NAIPv2: more real data, but a measurably easier task
+
+Found while deciding whether to download v1's 177 GB synthetic component. The v1 README points
+to a v2 release, and v2's cross-sensor variant is the highest-value data available by a wide
+margin:
+
+| | v1 cross-sensor | **v2 cross-sensor** | v1 synthetic |
+|---|---|---|---|
+| pairs | 2,851 | **8,000** | 17,657 |
+| size | 2.2 GB | **9.7 GB** | 180 GB |
+| real Sentinel-2 | yes | yes | **no -- LR is simulated** |
+| pairing window | same-day | 0 or +/-1 day | n/a |
+| cloud screening | -- | 0% cover (CloudSen12 UnetMob-V2) | n/a |
+
+2.8x more of the real task for 1/18th the download of the synthetic set. All 8,000 rows were
+inspected remotely via `tacoreader` before committing to the download -- the archive's metadata
+is readable over HTTP without pulling the payload.
+
+### Three silent incompatibilities with the v1 loader (all measured, none raise)
+
+1. **Tile geometry** is 520/130 px, not 484/121.
+2. **HR dtype is uint16 in Sentinel-2 reflectance units, not uint8 NAIP.** Applying v1's `/255`
+   rule to v2's HR overshoots by ~40x. Nothing raises; the images are simply wrong. Measured HR
+   means: v1 122.3 (uint8 range), v2 1420.2 (reflectance x10000).
+3. **HR is already radiometrically harmonized to the Sentinel-2 scale.** Per-band HR/LR mean
+   ratios over 20 ROIs: 1.000 / 0.999 / 0.999 / 1.000 -- max deviation 0.07%, against v1's
+   2.0-5.3x per-band mismatch. Applying `calibrate_lr_to_hr_radiometry` to v2 would INTRODUCE the
+   error that function exists to remove.
+
+Handled by `DATASET_VARIANTS` in `sen2naip_dataset.py` plus a `variant=` argument threaded
+through every call site (7 scripts). The variant supplies the *default* for
+`radiometric_calibration`, so the correct behaviour is not something a caller has to remember.
+
+### The important caveat: v2 numbers are NOT comparable to v1 numbers
+
+v2's HR was harmonized *using the real Sentinel-2 as reference*, which pulls the target toward
+the input. Measured, over 20 held-out tiles each:
+
+| | corr(avgpool4(HR), LR) | median relative residual |
+|---|---|---|
+| v1 | 0.850 median, min 0.359 | 15.0% |
+| v2 | 0.995 median, min 0.970 | 3.8% |
+
+The LR is still genuinely independent -- a 3.8% residual means it is not merely a downsampled
+HR, so there is no leakage -- but v2 is a materially easier reconstruction problem than v1.
+
+Consequences, to be applied when reporting:
+
+* **Model-vs-bicubic comparisons remain valid within a release**, because both face the same
+  target. Those are the headline numbers.
+* **Absolute PSNR must never be compared across releases.** A jump from switching to v2 would
+  be an easier target, not a better model. Run 10's +0.6948 dB was measured on v1 and stays the
+  reference point.
+* Plan: train on v2 for the extra data, and evaluate on held-out **v1** as well -- the harder,
+  more realistic pairing, and the one every earlier number was measured against.
+
+### Item 2 measured: raising spectral loss weights tightens SAM, but the gain does not propagate downstream
+
+Three 3-epoch fine-tunes from run 10's converged core (`--init-from`, `--lr 5e-5`,
+`scripts/sweep_spectral_weights.sh`): control (w_sam=0.3, w_index=0.2, i.e. run 10's own
+weights), mid (1.0/0.6), high (2.0/1.2). A control arm at the ORIGINAL weights is included
+because fine-tuning itself moves every metric -- without it, any change in the other arms is
+unattributable.
+
+Best epoch per arm, weight-independent metrics only (`val_total_loss` is not comparable across
+arms: each optimises a different objective by construction):
+
+| metric | control | mid | high | control's own drift |
+|---|---|---|---|---|
+| val_psnr | 22.4335 | 22.4343 | 22.3553 | +0.2704 |
+| val_ssim_metric | 0.6574 | 0.6567 | 0.6558 | +0.0028 |
+| val_rmse | 0.0811 | 0.0813 | 0.0821 | -0.0024 |
+| val_sam_degrees (lower better) | 4.5437 | 4.4097 | 4.3817 | -0.0861 |
+| val_downstream_improvement | 0.0166 | 0.0171 | 0.0170 | +0.0007 |
+
+**PSNR, SSIM, RMSE and the downstream classification metric are all noise.** Every gap between
+arms on those four is smaller than the control's own drift from fine-tuning alone (+0.27 dB
+PSNR from nothing but 3 epochs at a lower LR) -- so nothing beyond "more training helps" can be
+claimed from them.
+
+**`val_sam_degrees` is different.** It moves monotonically with the weight -- control 4.54 ->
+mid 4.41 -> high 4.38 -- and both mid's and high's improvement (0.13, 0.16 degrees) exceed the
+control's own drift (0.09 degrees). That is the signature of a real, dose-responsive effect
+rather than noise, though on n=3 epochs per arm with no per-tile pairing this is suggestive
+evidence, not a tested significance claim (contrast the uncertainty-head ablation, which had
+200 paired tiles and a formal test).
+
+**Read: raising w_sam/w_index buys spectral-angle accuracy specifically, at no cost to pixel
+fidelity, but that gain does not convert into the downstream NDVI-classification metric.** It is
+real by one measure and inert by the one closer to what the PS cares about.
+
+**Recommendation for the big run: keep the current 0.3/0.2 default.** The metrics that matter
+most (PSNR, downstream accuracy) show no benefit from raising the weights, and `high` trades a
+real fidelity cost for extra SAM tightening that a downstream task does not use. If spectral
+accuracy becomes a target in its own right (e.g. an NDVI-specific use case in the demo), a
+`mid`-range weight is defensible; `high` is not.

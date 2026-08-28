@@ -1,0 +1,67 @@
+2026-08-28 14:27:35,961 [INFO] frozen core: res_scale=0.1 patch=96 scale=4 n_bands=4
+2026-08-28 14:27:36,028 [INFO] 2281 train ROIs, 570 held-out (200 used for scoring)
+2026-08-28 14:27:37,627 [INFO] [edge=False] head params=12,740  target steps=2000
+C:\Projects\spectra-sr\scripts\ablate_uncertainty_head.py:98: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+  running += float(nll)
+2026-08-28 14:29:25,949 [INFO] [edge=False] step   500/2000 nll=-1.3945
+2026-08-28 14:31:17,789 [INFO] [edge=False] step  1000/2000 nll=-1.6980
+2026-08-28 14:33:09,793 [INFO] [edge=False] step  1500/2000 nll=-1.8348
+2026-08-28 14:35:02,750 [INFO] [edge=False] step  2000/2000 nll=-1.8204
+2026-08-28 14:35:31,318 [INFO] {
+  "tag": "baseline",
+  "n_tiles": 200,
+  "nll": -1.8613325560092926,
+  "z_std_raw": 1.0856850147247314,
+  "ece_raw": 0.033498564833088926,
+  "recalibration_factor": 1.0067156553268433,
+  "ece_recalibrated": 0.03126504742785504,
+  "sigma2_coverage_recalibrated": 0.9385012984275818,
+  "corr_mean": 0.1579798012971878,
+  "corr_median": 0.16116264462471008,
+  "corr_frac_positive": 0.75,
+  "verdict_raw": "well calibrated"
+}
+2026-08-28 14:35:31,324 [INFO] [edge=True] head params=13,316  target steps=2000
+2026-08-28 14:37:24,879 [INFO] [edge=True] step   500/2000 nll=-1.4676
+2026-08-28 14:39:19,066 [INFO] [edge=True] step  1000/2000 nll=-1.7310
+2026-08-28 14:41:13,135 [INFO] [edge=True] step  1500/2000 nll=-1.8324
+2026-08-28 14:43:07,188 [INFO] [edge=True] step  2000/2000 nll=-1.8269
+2026-08-28 14:43:35,240 [INFO] {
+  "tag": "edge",
+  "n_tiles": 200,
+  "nll": -1.8476578223705291,
+  "z_std_raw": 1.1130720376968384,
+  "ece_raw": 0.03416867809076058,
+  "recalibration_factor": 1.0013376474380493,
+  "ece_recalibrated": 0.03372918128183013,
+  "sigma2_coverage_recalibrated": 0.925963819026947,
+  "corr_mean": 0.17665591835975647,
+  "corr_median": 0.1889076828956604,
+  "corr_frac_positive": 0.8450000286102295,
+  "verdict_raw": "well calibrated"
+}
+2026-08-28 14:43:35,251 [INFO] significance: {
+  "mean_delta_corr": 0.0186761236070015,
+  "ci95_low": 0.006215661902046659,
+  "ci95_high": 0.031136585311956344,
+  "paired_t_p": 0.0036966699116122276,
+  "wilcoxon_p": 0.022006281942722812,
+  "cohens_d": 0.2077273488295681,
+  "win_rate": 0.555,
+  "n": 200
+}
+
+==============================================================================
+metric                                  baseline          edge         delta
+------------------------------------------------------------------------------
+nll                                      -1.8613       -1.8477      +0.0137  worse
+ece_recalibrated                          0.0313        0.0337      +0.0025  worse
+corr_mean                                 0.1580        0.1767      +0.0187  better
+corr_median                               0.1612        0.1889      +0.0277  better
+corr_frac_positive                        0.7500        0.8450      +0.0950  better
+==============================================================================
+per-tile correlation, paired over n=200 tiles:
+  mean delta +0.0187  95% CI [+0.0062, +0.0311]
+  paired t p=3.697e-03   Wilcoxon p=2.201e-02   Cohen's d=0.208   win rate 55.5%
+wrote results/uncertainty_ablation.json
