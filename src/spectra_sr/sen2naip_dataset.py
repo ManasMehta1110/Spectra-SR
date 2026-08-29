@@ -163,7 +163,8 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
 
     def __init__(self, root_dir: str, hr_patch_size: int = 384, crops_per_file: int = 20,
                  roi_list: Optional[List[str]] = None, seed: Optional[int] = None,
-                 radiometric_calibration: Optional[bool] = None, variant: str = "v1"):
+                 radiometric_calibration: Optional[bool] = None, variant: str = "v1",
+                 deterministic: bool = False):
         if variant not in DATASET_VARIANTS:
             raise ValueError(f"variant must be one of {sorted(DATASET_VARIANTS)}, got {variant!r}")
         spec = DATASET_VARIANTS[variant]
@@ -198,6 +199,8 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
         self.lr_tile_size = lr_tile_size
         self.hr_divisor = spec["hr_divisor"]
         self.lr_divisor = spec["lr_divisor"]
+        self.seed = seed
+        self.deterministic = deterministic
         self.rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
@@ -208,8 +211,26 @@ class SEN2NAIPCrossSensorDataset(torch.utils.data.Dataset):
         roi_dir = os.path.join(self.root_dir, roi)
 
         max_lr_xy = self.lr_tile_size - self.lr_patch_size
-        x0_lr = int(self.rng.integers(0, max_lr_xy + 1))
-        y0_lr = int(self.rng.integers(0, max_lr_xy + 1))
+        if self.deterministic:
+            # A crop offset that is a pure function of (seed, idx), not a draw consumed from
+            # self.rng's shared, advancing stream. Matters specifically because this dataset is
+            # constructed ONCE and reused across every epoch of a training run: with the shared
+            # stream, epoch 0's validation pass consumes hundreds of draws from self.rng, so
+            # epoch 1's call to the SAME idx lands wherever that stream left off and reads a
+            # DIFFERENT crop of the SAME ROI -- silently mixing crop-sampling noise into every
+            # epoch-to-epoch validation comparison (confirmed: this dataset's val_dataset is
+            # built once before train_pretrain.py's epoch loop, not once per epoch). A per-item
+            # generator seeded by (seed, idx) makes ds[idx] return the identical crop no matter
+            # how many other items were read first, so "epoch 0 vs epoch N" compares the same
+            # pixels every time. Intentionally NOT the default: training benefits from crops
+            # varying across epochs (implicit augmentation), so only validation/eval callers
+            # should opt in.
+            item_rng = np.random.default_rng((self.seed or 0, idx))
+            x0_lr = int(item_rng.integers(0, max_lr_xy + 1))
+            y0_lr = int(item_rng.integers(0, max_lr_xy + 1))
+        else:
+            x0_lr = int(self.rng.integers(0, max_lr_xy + 1))
+            y0_lr = int(self.rng.integers(0, max_lr_xy + 1))
         x0_hr, y0_hr = x0_lr * NATIVE_SCALE, y0_lr * NATIVE_SCALE
 
         with rasterio.open(os.path.join(roi_dir, "lr.tif")) as src:

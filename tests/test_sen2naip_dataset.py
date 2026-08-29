@@ -273,3 +273,65 @@ def test_unknown_variant_is_rejected(tmp_path):
     root = _make_v2_pair(str(tmp_path / "v2"))
     with pytest.raises(ValueError, match="variant must be one of"):
         SEN2NAIPCrossSensorDataset(root, hr_patch_size=384, variant="v3")
+
+
+def test_deterministic_crop_survives_prior_reads_of_other_indices():
+    """The bug this guards against, found via external review and verified real: train_pretrain.py
+    builds val_dataset ONCE and reuses it across every epoch. With the old shared, advancing
+    self.rng, epoch 0's validation pass consumes hundreds of draws; epoch 1's call to the SAME
+    idx then reads wherever that stream left off -- a DIFFERENT crop of the SAME ROI. That mixes
+    crop-sampling noise into every epoch-to-epoch comparison, including run 10's reported
+    epoch-to-epoch PSNR swings.
+
+    With deterministic=True, ds[idx] must return the identical crop regardless of how many other
+    indices were read first -- i.e. it must be a pure function of (seed, idx), not of call order.
+    """
+    all_rois = sorted(
+        d for d in os.listdir(SEN2NAIP_DIR)
+        if os.path.isdir(os.path.join(SEN2NAIP_DIR, d)) and d.startswith("ROI_")
+    )
+    ds = SEN2NAIPCrossSensorDataset(SEN2NAIP_DIR, hr_patch_size=64, crops_per_file=2, seed=7,
+                                    deterministic=True, roi_list=all_rois[:5])
+
+    lr_before, hr_before = ds[0]
+
+    # Simulate "several epochs" of validation traffic reading every index many times, exactly
+    # the access pattern _run_validation produces across repeated calls on one shared dataset --
+    # bounded to a handful of ROIs so the test stays fast; the property being tested (idx=0
+    # unaffected by prior reads of other indices) doesn't need the full real dataset to exercise.
+    for _ in range(5):
+        for i in range(len(ds)):
+            ds[i]
+
+    lr_after, hr_after = ds[0]
+    assert torch.equal(lr_before, lr_after)
+    assert torch.equal(hr_before, hr_after)
+
+
+def test_non_deterministic_mode_is_unchanged_default_behavior():
+    """deterministic defaults to False -- training keeps its existing behavior (crops vary
+    across repeated reads), since that variety is desirable augmentation there, not noise."""
+    ds = SEN2NAIPCrossSensorDataset(SEN2NAIP_DIR, hr_patch_size=64, crops_per_file=2, seed=7)
+    assert ds.deterministic is False
+
+    first_lr, _ = ds[0]
+    for i in range(len(ds)):
+        ds[i]
+    second_lr, _ = ds[0]
+    # Not a hard guarantee for every seed/geometry combination, but true for this fixture and
+    # exactly the drift the fix targets -- if this ever starts passing by coincidence, the crop
+    # geometry changed and the test fixture needs a wider offset range, not a weaker assertion.
+    assert not torch.equal(first_lr, second_lr)
+
+
+def test_deterministic_differs_by_index_not_constant():
+    """A deterministic crop must still vary BY index -- guards against a degenerate
+    implementation that returns the same crop for every idx just because it no longer varies by
+    call order."""
+    ds = SEN2NAIPCrossSensorDataset(SEN2NAIP_DIR, hr_patch_size=64, crops_per_file=1, seed=7,
+                                    deterministic=True, roi_list=None)
+    if len(ds) < 2:
+        pytest.skip("fixture has too few ROIs to compare two distinct indices")
+    lr0, _ = ds[0]
+    lr1, _ = ds[1]
+    assert not torch.equal(lr0, lr1)
