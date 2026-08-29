@@ -34,7 +34,7 @@ from spectra_sr.uncertainty import UncertaintyHead, heteroscedastic_nll_loss
 from train_pretrain import CONFIGS  # noqa: E402
 
 
-def probe(cfg, batch_size: int, device, steps: int = 3) -> dict:
+def probe(cfg, batch_size: int, device, steps: int = 3, use_amp: bool = False) -> dict:
     """One cell of the grid. Returns peak allocated/reserved MiB, or an oom flag.
 
     Runs several steps rather than one: the first step allocates the optimizer state lazily
@@ -51,6 +51,7 @@ def probe(cfg, batch_size: int, device, steps: int = 3) -> dict:
         criterion = SpectraCombinedLoss(degradation).to(device)
         optimizer = torch.optim.Adam(
             list(model.parameters()) + list(head.parameters()), lr=2e-4)
+        scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp)
 
         lr_size = cfg.train_patch_size
         hr_size = lr_size * cfg.scale
@@ -59,15 +60,17 @@ def probe(cfg, batch_size: int, device, steps: int = 3) -> dict:
             hr_img = torch.rand(batch_size, cfg.n_bands, hr_size, hr_size, device=device)
 
             optimizer.zero_grad()
-            pred = model(lr_img)
-            loss_terms = criterion(pred, hr_img, lr_img)
-            residual = lr_img - degradation.forward(pred)
-            residual_up = torch.nn.functional.interpolate(
-                residual, size=pred.shape[-2:], mode="nearest")
-            log_var = head(pred.detach(), residual_up)
-            total = loss_terms["total"] + heteroscedastic_nll_loss(pred.detach(), hr_img, log_var)
-            total.backward()
-            optimizer.step()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                pred = model(lr_img)
+                loss_terms = criterion(pred, hr_img, lr_img)
+                residual = lr_img - degradation.forward(pred)
+                residual_up = torch.nn.functional.interpolate(
+                    residual, size=pred.shape[-2:], mode="nearest")
+                log_var = head(pred.detach(), residual_up)
+                total = loss_terms["total"] + heteroscedastic_nll_loss(pred.detach(), hr_img, log_var)
+            scaler.scale(total).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
         peak_alloc = torch.cuda.max_memory_allocated(device) / 2 ** 20
         peak_reserved = torch.cuda.max_memory_reserved(device) / 2 ** 20
@@ -88,6 +91,10 @@ def main():
     p.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4, 8, 16])
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--out", default="results/memory_probe.json")
+    p.add_argument("--amp", action="store_true",
+                   help="Probe with mixed precision (fp16 autocast + GradScaler) instead of fp32 "
+                        "-- run this after a plain probe shows a config too tight against the "
+                        "~85%% target, to see whether AMP buys enough headroom back.")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -106,7 +113,7 @@ def main():
     for config_name in args.configs:
         cfg = CONFIGS[config_name]
         for batch_size in args.batch_sizes:
-            r = probe(cfg, batch_size, device, steps=args.steps)
+            r = probe(cfg, batch_size, device, steps=args.steps, use_amp=args.amp)
             r.update({"config": config_name, "batch_size": batch_size,
                       "train_patch_size": cfg.train_patch_size})
             rows.append(r)

@@ -62,7 +62,8 @@ def _split_train_val_files(naip_dir: str, val_fraction: float = 0.2):
     return train_files, val_files
 
 
-def _run_validation(model, uncertainty_head, criterion, degradation, val_loader) -> dict:
+def _run_validation(model, uncertainty_head, criterion, degradation, val_loader,
+                    use_amp: bool = False) -> dict:
     """Everything needed to plot real curves later, not just the loss the optimizer sees:
     the differentiable loss terms (train/val comparability), PLUS plain accuracy-assessment
     metrics (PSNR/SSIM/RMSE/SAM-degrees, via spectra_sr.metrics.compute_metrics -- the actual
@@ -79,13 +80,16 @@ def _run_validation(model, uncertainty_head, criterion, degradation, val_loader)
     with torch.no_grad():
         for lr, hr in val_loader:
             lr, hr = lr.to(DEVICE), hr.to(DEVICE)
-            pred = model(lr)
-            terms = criterion(pred, hr, lr)
-            residual = lr - degradation.forward(pred)
-            residual_up = torch.nn.functional.interpolate(residual, size=pred.shape[-2:],
-                                                            mode="nearest")
-            log_var = uncertainty_head(pred, residual_up)
-            nll = heteroscedastic_nll_loss(pred, hr, log_var)
+            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=use_amp):
+                pred = model(lr)
+                terms = criterion(pred, hr, lr)
+                residual = lr - degradation.forward(pred)
+                residual_up = torch.nn.functional.interpolate(residual, size=pred.shape[-2:],
+                                                                mode="nearest")
+                log_var = uncertainty_head(pred, residual_up)
+                nll = heteroscedastic_nll_loss(pred, hr, log_var)
+            pred = pred.float()  # metrics (PSNR/SSIM/downstream) computed in fp32 for numerical
+                                  # precision regardless of the training/inference dtype
 
             acc = compute_metrics(pred, hr)
             down = downstream_classification_agreement(pred, lr, hr)
@@ -114,7 +118,7 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
           seed: int = 0, val_fraction: float = 0.2, keep_last_n: int = 3,
           lr: float = 1e-3, grad_clip_norm: float = 5.0, use_lr_schedule: bool = True,
           w_gradient: float = 0.3, w_perceptual: float = 0.0,
-          w_sam: float = 0.3, w_index: float = 0.2,
+          w_sam: float = 0.3, w_index: float = 0.2, w_cycle: float = 0.5,
           data_source: str = "naip_synthetic",
           sen2naip_synthetic_dir: str = "data/raw/sen2naip/synthetic",
           sen2naip_synthetic_era: str = "both",
@@ -125,7 +129,7 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
           res_scale: Optional[float] = None,
           val_every_n_steps: int = 0, step_val_tiles: int = 64,
           resume: Optional[str] = None, hf_backup_every_n_epochs: int = 0,
-          init_from: Optional[str] = None) -> dict:
+          init_from: Optional[str] = None, use_amp: bool = False) -> dict:
     set_seed(seed)
     cfg = CONFIGS[config_name]
     if res_scale is not None:
@@ -175,7 +179,14 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
         val_dataset = SEN2NAIPCrossSensorDataset(sen2naip_dir, hr_patch_size=hr_patch_size,
                                                    crops_per_file=sen2naip_val_crops,
                                                    roi_list=val_rois, seed=seed + 1,
-                                                   variant=sen2naip_variant)
+                                                   variant=sen2naip_variant, deterministic=True)
+        # deterministic=True: this dataset is built once, here, and reused across every epoch
+        # below -- without it, epoch N's validation reads different crops of the same ROIs than
+        # epoch 0's did, purely from self.rng's shared state advancing, mixing crop-sampling
+        # noise into every epoch-to-epoch comparison. See the flag's docstring in
+        # sen2naip_dataset.py for the full reasoning. Train dataset deliberately keeps the old
+        # (non-deterministic) behavior -- crops varying across epochs is desirable augmentation
+        # there, not noise.
     elif data_source == "naip_synthetic":
         train_files, val_files = _split_train_val_files(naip_dir, val_fraction)
         logger.info(f"Train files: {len(train_files)}, held-out val files: {len(val_files)}")
@@ -233,9 +244,9 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
     uncertainty_head = UncertaintyHead(n_bands=cfg.n_bands).to(DEVICE)
     criterion = SpectraCombinedLoss(degradation, w_gradient=w_gradient,
                                      w_perceptual=w_perceptual,
-                                     w_sam=w_sam, w_index=w_index).to(DEVICE)
+                                     w_sam=w_sam, w_index=w_index, w_cycle=w_cycle).to(DEVICE)
     logger.info(f'loss weights: charbonnier=1.0 ssim=0.2 sam={w_sam} index={w_index} '
-                f'cycle=0.5 gradient={w_gradient} perceptual={w_perceptual}')
+                f'cycle={w_cycle} gradient={w_gradient} perceptual={w_perceptual}')
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(uncertainty_head.parameters()), lr=lr)
     # Real, confirmed finding from pretrain_run1/run2/run3 (all three, despite varying data
@@ -291,6 +302,10 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
                            f"); training it from scratch.")
         logger.info(f"warm start from {init_from} (weights only; fresh optimiser and schedule)")
 
+    scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=use_amp)
+    if use_amp:
+        logger.info("mixed precision (fp16 autocast + GradScaler) enabled")
+
     # Resume. Colab sessions disconnect; without this, a run that dies at epoch 15 of 25 restarts
     # from scratch and the compute already spent is simply gone. Restoring the model alone is NOT
     # enough and would be quietly wrong in two ways: Adam's first/second moment estimates would
@@ -324,6 +339,12 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
                     f"matching neither run. Re-run with --epochs {ckpt['epochs']}, or add "
                     f"--no-lr-schedule to opt out of the schedule entirely.")
             scheduler.load_state_dict(ckpt["scheduler"])
+        if use_amp and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        elif use_amp:
+            logger.warning("--resume checkpoint has no scaler state (written before --amp "
+                           "support, or saved from a non-amp run); GradScaler starts at its "
+                           "default initial scale and will recalibrate over the first few steps.")
         start_epoch = ckpt["epoch"] + 1
         best_val_total = ckpt.get("best_val_total", ckpt.get("val_total_loss", float("inf")))
         global_step_resumed = ckpt.get("global_step", 0)
@@ -368,23 +389,36 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             lr, hr = lr.to(DEVICE), hr.to(DEVICE)
 
             optimizer.zero_grad()
-            pred = model(lr)
-            loss_terms = criterion(pred, hr, lr)
+            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=use_amp):
+                pred = model(lr)
+                loss_terms = criterion(pred, hr, lr)
 
-            residual = lr - degradation.forward(pred)
-            residual_up = torch.nn.functional.interpolate(residual, size=pred.shape[-2:],
-                                                            mode="nearest")
-            log_var = uncertainty_head(pred.detach(), residual_up)  # detach: the uncertainty
-            # head should learn to *describe* the core's errors, not reshape the core to make
-            # itself easier to predict
-            nll = heteroscedastic_nll_loss(pred.detach(), hr, log_var)
+                residual = lr - degradation.forward(pred)
+                residual_up = torch.nn.functional.interpolate(residual, size=pred.shape[-2:],
+                                                                mode="nearest")
+                log_var = uncertainty_head(pred.detach(), residual_up)  # detach: the uncertainty
+                # head should learn to *describe* the core's errors, not reshape the core to make
+                # itself easier to predict
+                nll = heteroscedastic_nll_loss(pred.detach(), hr, log_var)
 
-            total_loss = loss_terms["total"] + nll
-            total_loss.backward()
+                total_loss = loss_terms["total"] + nll
+
+            # fp16 has a much narrower exponent range than fp32 -- small gradients can silently
+            # underflow to zero without a scaler. GradScaler multiplies the loss up before
+            # backward (keeping gradients representable in fp16), then unscales them back down
+            # before anything touches raw gradient values. Order matters: gradient clipping and
+            # the optimizer step must see UNSCALED gradients, so unscale_() runs before clipping,
+            # never after -- clipping scaled gradients would clip against the wrong threshold
+            # entirely (inflated by the scale factor, typically in the tens of thousands).
+            # bf16 (no scaler needed, same exponent range as fp32) is not used here because T4
+            # (Turing) has no hardware bf16 support -- only Ampere/later do.
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(uncertainty_head.parameters()),
                 max_norm=grad_clip_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_totals["charbonnier"] += float(loss_terms["charbonnier"])
             train_totals["ssim_loss"] += float(loss_terms["ssim"])
@@ -400,7 +434,7 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
 
             if step_loader is not None and global_step % val_every_n_steps == 0:
                 step_val = _run_validation(model, uncertainty_head, criterion, degradation,
-                                            step_loader)
+                                            step_loader, use_amp=use_amp)
                 step_record = {
                     "step_eval": True, "global_step": global_step, "epoch": epoch,
                     "lr": optimizer.param_groups[0]["lr"],
@@ -414,7 +448,8 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
                             f"val_ssim={step_val['ssim_metric']:.4f}")
 
         train_avg = {k: v / max(n_batches, 1) for k, v in train_totals.items()}
-        val_avg = _run_validation(model, uncertainty_head, criterion, degradation, val_loader)
+        val_avg = _run_validation(model, uncertainty_head, criterion, degradation, val_loader,
+                                  use_amp=use_amp)
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
@@ -446,6 +481,7 @@ def train(config_name: str, epochs: int, batch_size: int, out_dir: str, naip_dir
             # merely reloading weights. See the resume block above for why each is required.
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if use_amp else None,
             "best_val_total": min(best_val_total, val_avg["total_loss"]),
             "global_step": global_step,
             # Recorded so --resume can detect a changed --epochs. CosineAnnealingLR is
@@ -518,6 +554,12 @@ if __name__ == "__main__":
                    help="Disable the cosine LR decay (default: enabled) -- kept as an escape "
                         "hatch for isolating whether the schedule or the clip-norm change is "
                         "doing the work, if it ever needs re-splitting into two experiments.")
+    p.add_argument("--amp", action="store_true",
+                   help="Mixed precision (fp16 autocast + GradScaler). Roughly halves activation "
+                        "memory -- measured need: FULL at batch=1 uses 97.4%% of a 16GB T4 "
+                        "without this, leaving almost no headroom for validation or "
+                        "fragmentation over a long run. Uses fp16 (not bf16): T4 (Turing) has no "
+                        "hardware bf16 support, only Ampere/later do.")
     p.add_argument("--w-gradient", type=float, default=0.3,
                    help="Weight on the edge-aware gradient-domain loss term. Raised from the "
                         "original 0.3 default after visualize_predictions.py showed the model "
@@ -566,6 +608,14 @@ if __name__ == "__main__":
                         "is dominated by pixel fidelity.")
     p.add_argument("--w-index", type=float, default=0.2,
                    help="NDVI/NDWI preservation loss weight. See --w-sam.")
+    p.add_argument("--w-cycle", type=float, default=0.5,
+                   help="Re-degradation cycle-consistency loss weight: ||A(pred) - lr||^2. "
+                        "Previously a buried constructor default with no CLI override. Real "
+                        "caveat for --data-source sen2naip: A's sigma is a frozen PLACEHOLDER "
+                        "(never fit against real Sentinel-2, never in the optimizer's parameter "
+                        "list) for that data source, so this weight is currently trusting an "
+                        "unvalidated forward model with real training authority. Worth running "
+                        "at 0 as a diagnostic on real data before assuming this term is helping.")
     p.add_argument("--res-scale", type=float, default=None,
                    help="EDSR-style residual scaling per attention group. Without it, "
                         "activations compounded ~2x per group and killed the residual branch "
@@ -616,7 +666,7 @@ if __name__ == "__main__":
           lr=args.lr, grad_clip_norm=args.grad_clip_norm,
           use_lr_schedule=not args.no_lr_schedule,
           w_gradient=args.w_gradient, w_perceptual=args.w_perceptual,
-          w_sam=args.w_sam, w_index=args.w_index,
+          w_sam=args.w_sam, w_index=args.w_index, w_cycle=args.w_cycle,
           data_source=args.data_source,
           sen2naip_synthetic_dir=args.sen2naip_synthetic_dir,
           sen2naip_synthetic_era=args.sen2naip_synthetic_era,
@@ -628,4 +678,4 @@ if __name__ == "__main__":
           res_scale=args.res_scale,
           val_every_n_steps=args.val_every_n_steps, step_val_tiles=args.step_val_tiles,
           resume=args.resume, hf_backup_every_n_epochs=args.hf_backup_every_n_epochs,
-          init_from=args.init_from)
+          init_from=args.init_from, use_amp=args.amp)
