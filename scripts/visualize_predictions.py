@@ -136,12 +136,18 @@ def main():
             # Same radiometric matching the downstream metric applies (metrics._match_radiometry)
             # -- without it the real-Sentinel-2 bicubic panel renders far darker than the NAIP HR
             # panel, and the comparison reads as a brightness difference rather than the sharpness
-            # difference actually being judged.
+            # difference actually being judged. Applied to ALL THREE comparable panels (LR,
+            # bicubic, SR) -- matching only LR/bicubic and leaving SR raw was a real bug: SR is
+            # bicubic(LR) + a small residual, so its raw statistics track bicubic's almost
+            # exactly and inherit the same cross-sensor offset from truth that bicubic had
+            # artificially removed. Every image made with the old code showed SR looking WORSE
+            # than bicubic -- the opposite of the real (unmatched) accuracy numbers.
             bicubic_shown = _match_radiometry(bicubic, hr)
             lr_shown = _match_radiometry(
                 F.interpolate(lr, size=hr.shape[-2:], mode="nearest"), hr)
+            pred_shown = _match_radiometry(pred, hr)
 
-        panels = [lr_shown[0], bicubic_shown[0], pred[0], hr[0]]
+        panels = [lr_shown[0], bicubic_shown[0], pred_shown[0], hr[0]]
         combined = np.concatenate([to_uint8_rgb(v) for v in panels], axis=1)
         Image.fromarray(combined).save(os.path.join(args.out_dir, f"{name}_comparison.png"))
         print(f"  saved {name}_comparison.png  (order: LR-nearest | bicubic | SR output | true HR)")

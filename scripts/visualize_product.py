@@ -97,8 +97,19 @@ def main():
             unc = r.uncertainty_std.mean(dim=1)[0]
 
         vmax = float(max(err.max(), unc.max()))
+        # All three left-hand panels (LR, bicubic, SR) get the SAME radiometric match against
+        # truth -- purely a display convention, not the accuracy metric (which already scores
+        # SR on its raw, unmatched output elsewhere). Matching LR/bicubic but leaving SR raw was
+        # a real bug: SR = bicubic(LR) + a small residual (res_scale=0.2), so SR's own raw
+        # statistics track bicubic's almost exactly (measured: e.g. mean 0.510 vs 0.508 on one
+        # real tile) -- meaning SR inherited the SAME cross-sensor radiometric offset from truth
+        # that _match_radiometry exists to correct, while bicubic had that offset artificially
+        # removed. Every image made with the old code therefore showed SR looking WORSE than
+        # bicubic, the opposite of what the real (unmatched) accuracy numbers say. Same failure
+        # mode as Bug 4 in findings.md -- an unfair baseline advantage -- recurring in the
+        # visualization instead of the metric.
         panels = [rgb(_match_radiometry(lo_up, hi)[0]), rgb(_match_radiometry(bic, hi)[0]),
-                  rgb(r.image[0]), rgb(hi[0]), heat(unc, vmax), heat(err, vmax)]
+                  rgb(_match_radiometry(r.image, hi)[0]), rgb(hi[0]), heat(unc, vmax), heat(err, vmax)]
         h, w = panels[0].shape[:2]
         sep = np.full((h, GAP, 3), 245, dtype=np.uint8)
         strip = []

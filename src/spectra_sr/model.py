@@ -400,7 +400,24 @@ class SpectraHATCore(nn.Module):
         nn.init.zeros_(self.output_conv.bias)
 
     def forward(self, lr: torch.Tensor) -> torch.Tensor:
-        """lr: (B, n_bands, H, W) -> (B, n_bands, H*scale, W*scale)."""
+        """lr: (B, n_bands, H, W) -> (B, n_bands, H*scale, W*scale).
+
+        Window attention requires H and W divisible by window_size (see window_partition).
+        Training always feeds train_patch_size, which __post_init__ already guarantees is a
+        clean multiple, so this pad is a genuine no-op then -- it exists for inference on
+        real-world crops that don't happen to land on a multiple of 16, which previously hard
+        crashed (RuntimeError from window_partition's .view()) instead of running. Padded with
+        reflect (bottom/right only, so cropping the output back is a simple slice) and cropped
+        back to the exact requested output size before returning, so the caller never sees the
+        padding.
+        """
+        _, _, h, w = lr.shape
+        ws = self.config.window_size
+        pad_h = (ws - h % ws) % ws
+        pad_w = (ws - w % ws) % ws
+        if pad_h or pad_w:
+            lr = F.pad(lr, [0, pad_w, 0, pad_h], mode="reflect")
+
         shallow_feat = self.shallow(lr)
 
         x = shallow_feat
@@ -414,7 +431,11 @@ class SpectraHATCore(nn.Module):
 
         bicubic = F.interpolate(lr, scale_factor=self.config.scale, mode="bicubic",
                                  align_corners=False)
-        return bicubic + residual
+        out = bicubic + residual
+
+        if pad_h or pad_w:
+            out = out[:, :, :h * self.config.scale, :w * self.config.scale]
+        return out
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

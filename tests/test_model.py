@@ -90,6 +90,38 @@ def test_gradients_flow_to_every_parameter():
     assert not dead_params, f"parameters with no gradient at all: {dead_params}"
 
 
+def test_forward_handles_input_not_divisible_by_window_size():
+    """Real bug this guards: window_partition's .view() requires H and W divisible by
+    window_size, so before the auto-pad was added, any input size that wasn't a clean multiple
+    of window_size (e.g. a real-world scene crop, or SEN2NAIP v1's native 121px tiles) hard
+    crashed with a RuntimeError from inside window_partition -- confirmed empirically for sizes
+    121, 100, 130, 200, 500 against window_size=16. forward() now reflect-pads up to the next
+    multiple internally and crops the padding back out, so arbitrary sizes must just work."""
+    torch.manual_seed(0)
+    model = SpectraHATCore(SMOKE_TEST).eval()  # window_size=8
+    for size in (30, 50, 65, 100):  # none divisible by 8
+        assert size % SMOKE_TEST.window_size != 0
+        x = torch.randn(1, SMOKE_TEST.n_bands, size, size)
+        with torch.no_grad():
+            out = model(x)
+        expected = size * SMOKE_TEST.scale
+        assert out.shape == (1, SMOKE_TEST.n_bands, expected, expected), (
+            f"size={size}: got {out.shape}, expected (1, {SMOKE_TEST.n_bands}, "
+            f"{expected}, {expected})"
+        )
+
+
+def test_forward_auto_pad_is_a_no_op_at_exact_multiples():
+    """The auto-pad exists only for sizes that aren't a clean multiple of window_size --
+    training always feeds train_patch_size (already enforced divisible by window_size in
+    __post_init__), and this must stay a true no-op there, not a new source of drift in results
+    already produced at those sizes."""
+    ws = SMOKE_TEST.window_size
+    for size in (ws, 2 * ws, 3 * ws):
+        pad_h = (ws - size % ws) % ws
+        assert pad_h == 0
+
+
 def test_config_rejects_indivisible_patch_size():
     from spectra_sr.model import HATCoreConfig
     with pytest.raises(ValueError, match="divisible"):
